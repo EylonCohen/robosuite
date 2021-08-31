@@ -271,6 +271,6 @@ if __name__ == "__main__":
     # Wrap this environment in a visualization wrapper
     env = VisualizationWrapper(env, indicator_configs=None)
 
-    Git = 1
+    Git = 11
     # plot graphs
     # plotter(info)
