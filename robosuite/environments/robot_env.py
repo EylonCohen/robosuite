@@ -107,6 +107,7 @@ class RobotEnv(MujocoEnv):
         self,
         robots,
         env_configuration="default",
+        user_init_qpos=None,
         mount_types="default",
         controller_configs=None,
         initialization_noise=None,
@@ -137,6 +138,9 @@ class RobotEnv(MujocoEnv):
         self.robot_names = robots
         self.robots = self._input2list(None, self.num_robots)
         self._action_dim = None
+
+        # EC - set initial joint position
+        self.user_init_qpos = user_init_qpos
 
         # Mount
         mount_types = self._input2list(mount_types, self.num_robots)
@@ -429,6 +433,17 @@ class RobotEnv(MujocoEnv):
             # Lastly, replace camera names with the updated ones
             self.camera_names = temp_names
 
+    # EC -  get all path information
+    def get_path_info(self):
+        """
+
+        Returns:
+
+        """
+        for idx, robot in enumerate(self.robots):
+            info = robot.get_path_info()
+        return info
+
     def _pre_action(self, action, policy_step=False):
         """
         Overrides the superclass method to control the robot(s) within this enviornment using their respective
@@ -464,7 +479,7 @@ class RobotEnv(MujocoEnv):
         # Loop through robots and instantiate Robot object for each
         for idx, (name, config) in enumerate(zip(self.robot_names, self.robot_configs)):
             # Create the robot instance
-            self.robots[idx] = ROBOT_CLASS_MAPPING[name](robot_type=name, idn=idx, **config)
+            self.robots[idx] = ROBOT_CLASS_MAPPING[name](robot_type=name, idn=idx, initial_qpos=self.user_init_qpos, **config)
             # Now, load the robot models
             self.robots[idx].load_model()
 

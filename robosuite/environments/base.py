@@ -103,7 +103,7 @@ class MujocoEnv(metaclass=EnvMeta):
         render_visual_mesh=True,
         render_gpu_device_id=-1,
         control_freq=20,
-        horizon=1000,
+        horizon=None,
         ignore_done=False,
         hard_reset=True
     ):
@@ -148,6 +148,7 @@ class MujocoEnv(metaclass=EnvMeta):
 
         # Load observables
         self._observables = self._setup_observables()
+
 
     def initialize_time(self, control_freq):
         """
@@ -369,6 +370,7 @@ class MujocoEnv(metaclass=EnvMeta):
             raise ValueError("executing action in terminated episode")
 
         self.timestep += 1
+        # EC - temp_time = self.sim.data.time
 
         # Since the env.step frequency is slower than the mjsim timestep frequency, the internal controller will output
         # multiple torque commands in between new high level action commands. Therefore, we need to denote via
@@ -390,6 +392,14 @@ class MujocoEnv(metaclass=EnvMeta):
 
         reward, done, info = self._post_action(action)
         return self._get_observations(), reward, done, info
+
+    # EC -  get all path information
+    def get_path_info(self):
+        """
+
+        Returns:
+
+        """
 
     def _pre_action(self, action, policy_step=False):
         """

@@ -1,8 +1,19 @@
 import abc
 from collections.abc import Iterable
+from copy import deepcopy
+
 import numpy as np
 import mujoco_py
+from scipy.linalg import expm
+
 import robosuite.utils.macros as macros
+import robosuite.utils.angle_transformation as at
+from robosuite.utils.control_utils import *
+import robosuite.utils.transform_utils as T
+from scipy.spatial.transform import Rotation as R
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+from scipy.interpolate import interp1d
 
 
 class Controller(object, metaclass=abc.ABCMeta):
@@ -25,12 +36,16 @@ class Controller(object, metaclass=abc.ABCMeta):
 
         actuator_range (2-tuple of array of float): 2-Tuple (low, high) representing the robot joint actuator range
     """
+
     def __init__(self,
                  sim,
                  eef_name,
                  joint_indexes,
                  actuator_range,
-    ):
+                 plotting,
+                 collect_data,
+                 simulation_total_time,
+                 ):
 
         # Actuator range
         self.actuator_min = actuator_range[0]
@@ -70,6 +85,15 @@ class Controller(object, metaclass=abc.ABCMeta):
         self.J_full = None
         self.mass_matrix = None
 
+        self.interaction_forces = None
+        self.interaction_forces_vec = []
+        self.PD_force_command = []
+        self.desired_frame_FT_vec = []
+        self.desired_frame_imp_position_vec = []
+        self.desired_frame_imp_ori_vec = []
+        self.desired_frame_imp_vel_vec = []
+        self.desired_frame_imp_ang_vel_vec = []
+
         # Joint dimension
         self.joint_dim = len(joint_indexes["joints"])
 
@@ -87,6 +111,219 @@ class Controller(object, metaclass=abc.ABCMeta):
         self.initial_joint = self.joint_pos
         self.initial_ee_pos = self.ee_pos
         self.initial_ee_ori_mat = self.ee_ori_mat
+
+        # minimum jerk specification - EC
+        self.initial_position = self.initial_ee_pos
+        self.final_position = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
+        self.final_position = [self.initial_position[0], self.initial_position[1]-0.2, self.initial_position[2]]
+        self.initial_orientation = self.initial_ee_ori_mat
+        # self.final_orientation = np.array([[1, 0, 0],
+        #                                    [0, 0, 1],
+        #                                    [0, -1, 0]]) # peg horizantal
+        self.final_orientation = np.array([[1, 0, 0],
+                                           [0, -1, 0],
+                                           [0, 0, -1]])  # peg vertical (pointing down)
+
+        self.euler_initial_orientation = R.from_matrix(self.initial_orientation).as_euler('xyz', degrees=False)
+        self.euler_final_orientation = R.from_matrix(self.final_orientation).as_euler('xyz', degrees=False)
+        indexes_for_correction = np.abs(self.euler_final_orientation - self.euler_initial_orientation) > np.pi
+        correction = np.sign(self.euler_final_orientation) * (2 * np.pi) * indexes_for_correction
+        self.euler_final_orientation = self.euler_final_orientation - correction
+
+        self.simulation_total_time = simulation_total_time  # from main
+
+        # EC - Run further definition and class variables
+        self._specify_constants()
+
+        # EC - this is the vector for the impedance equations
+        self.X_m = np.zeros((12, 1))
+        self.is_contact = False  # becomes true when the peg hits the table
+        self.contact_time = 0.0
+        self.first_contact = True
+        self.Delta_T = 0.002
+        self.f_0 = np.array([0, 0, 0, 0, 0, 0])
+
+        self.K = 5000
+        self.M = 5
+        Wn = np.sqrt(self.K / self.M)
+        zeta = 0.707
+        # zeta = 1
+        self.C = 2 * self.M * zeta * Wn
+        # C = 0
+
+        self.K_imp = self.K * np.array([[1, 0, 0, 0, 0, 0],
+                                        [0, 1, 0, 0, 0, 0],
+                                        [0, 0, 1, 0, 0, 0],
+                                        [0, 0, 0, 1, 0, 0],
+                                        [0, 0, 0, 0, 1, 0],
+                                        [0, 0, 0, 0, 0, 1]])
+        self.C_imp = self.C * np.array([[1, 0, 0, 0, 0, 0],
+                                        [0, 1, 0, 0, 0, 0],
+                                        [0, 0, 1, 0, 0, 0],
+                                        [0, 0, 0, 1, 0, 0],
+                                        [0, 0, 0, 0, 1, 0],
+                                        [0, 0, 0, 0, 0, 1]])
+        self.M_imp = self.M * np.array([[1, 0, 0, 0, 0, 0],
+                                        [0, 1, 0, 0, 0, 0],
+                                        [0, 0, 1, 0, 0, 0],
+                                        [0, 0, 0, 1, 0, 0],
+                                        [0, 0, 0, 0, 1, 0],
+                                        [0, 0, 0, 0, 0, 1]])
+
+        # define if you want to plot some data
+        self.collect_data = collect_data
+        self.plotting = plotting
+
+    def impedance_computations(self):
+        # EC - compute next impedance Xm(n+1) and Vm(n+1) in world base frame.
+        # state space formulation
+        # X=[xm;thm;xm_d;thm_d] U=[F_int;M_int]
+        M_inv = np.linalg.pinv(self.M_imp)
+        A_1 = np.concatenate((np.zeros([6, 6], dtype=int), np.identity(6)), axis=1)
+        A_2 = np.concatenate((np.dot(-M_inv, self.K_imp), np.dot(-M_inv, self.C_imp)), axis=1)
+        A = np.concatenate((A_1, A_2), axis=0)
+
+        B_1 = np.zeros([6, 6], dtype=int)
+        B_2 = M_inv
+        B = np.concatenate((B_1, B_2), axis=0)
+
+        # discrete state space A, B matrices interaction_forces
+        A_d = expm(A * self.Delta_T)
+        B_d = np.dot(np.dot(np.linalg.pinv(A), (A_d - np.identity(A_d.shape[0]))), B)
+
+        # convert the forces and torques to the desired frame
+        Rotation_world_to_desired = R.from_euler("xyz", self.min_jerk_orientation, degrees=False).as_matrix()
+        Rotation_desired_to_world = Rotation_world_to_desired.T
+        F_d = Rotation_desired_to_world @ self.interaction_forces[:3]
+        M_d = Rotation_desired_to_world @ self.interaction_forces[3:6]
+        f_0 = np.concatenate((Rotation_desired_to_world @ self.f_0[:3],
+                              Rotation_desired_to_world @ self.f_0[3:6]), axis=0)
+        U = (f_0 + np.concatenate((F_d, M_d), axis=0)).reshape(6, 1)
+
+        # only for graphs!
+        if self.collect_data:
+            self.desired_frame_FT_vec.append(np.array(U))
+            self.desired_frame_imp_position_vec.append(np.array((self.X_m[:3]).reshape(3, )))
+            self.desired_frame_imp_ori_vec.append(np.array((self.X_m[3:6]).reshape(3, )))
+            self.desired_frame_imp_vel_vec.append(np.array((self.X_m[6:9]).reshape(3, )))
+            self.desired_frame_imp_ang_vel_vec.append(np.array((self.X_m[9:12]).reshape(3, )))
+
+        # discrete state solution X(k+1)=Ad*X(k)+Bd*U(k)
+        X_m_next = np.dot(A_d, self.X_m.reshape(12, 1)) + np.dot(B_d, U)
+
+        self.X_m = deepcopy(X_m_next)
+
+        return
+
+    def _min_jerk(self):
+        """
+        EC
+        Compute the value of position velocity and acceleration in a minimum jerk trajectory
+
+        """
+        t = self.time
+        x_traj = (self.X_final - self.X_init) / (self.tfinal ** 3) * (
+                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + self.X_init
+        y_traj = (self.Y_final - self.Y_init) / (self.tfinal ** 3) * (
+                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + self.Y_init
+        z_traj = (self.Z_final - self.Z_init) / (self.tfinal ** 3) * (
+                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + self.Z_init
+        self.min_jerk_position = np.array([x_traj, y_traj, z_traj])
+
+        # velocities
+        vx = (self.X_final - self.X_init) / (self.tfinal ** 3) * (
+                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+        vy = (self.Y_final - self.Y_init) / (self.tfinal ** 3) * (
+                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+        vz = (self.Z_final - self.Z_init) / (self.tfinal ** 3) * (
+                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+        self.min_jerk_velocity = np.array([vx, vy, vz])
+
+        # acceleration
+        ax = (self.X_final - self.X_init) / (self.tfinal ** 3) * (
+                120 * (t ** 3) / (self.tfinal ** 2) - 180 * (t ** 2) / self.tfinal + 60 * t)
+        ay = (self.Y_final - self.Y_init) / (self.tfinal ** 3) * (
+                120 * (t ** 3) / (self.tfinal ** 2) - 180 * (t ** 2) / self.tfinal + 60 * t)
+        az = (self.Z_final - self.Z_init) / (self.tfinal ** 3) * (
+                120 * (t ** 3) / (self.tfinal ** 2) - 180 * (t ** 2) / self.tfinal + 60 * t)
+        self.min_jerk_acceleration = np.array([ax, ay, az])
+
+        # euler xyz representation
+        alfa = (self.euler_final_orientation[0] - self.euler_initial_orientation[0]) / (self.tfinal ** 3) * (
+                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + \
+               self.euler_initial_orientation[0]
+        beta = (self.euler_final_orientation[1] - self.euler_initial_orientation[1]) / (self.tfinal ** 3) * (
+                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + \
+               self.euler_initial_orientation[1]
+        gamma = (self.euler_final_orientation[2] - self.euler_initial_orientation[2]) / (self.tfinal ** 3) * (
+                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + \
+                self.euler_initial_orientation[2]
+
+        alfa_dot = (self.euler_final_orientation[0] - self.euler_initial_orientation[0]) / (self.tfinal ** 3) * (
+                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+        beta_dot = (self.euler_final_orientation[1] - self.euler_initial_orientation[1]) / (self.tfinal ** 3) * (
+                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+        gamma_dot = (self.euler_final_orientation[2] - self.euler_initial_orientation[2]) / (self.tfinal ** 3) * (
+                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+
+        self.min_jerk_orientation = np.array([alfa, beta, gamma])
+        self.min_jerk_orientation_dot = np.array([alfa_dot, beta_dot, gamma_dot])
+        R_world_to_body = R.from_euler('xyz', self.min_jerk_orientation, degrees=False).as_matrix()
+        # w = T*V  -- the angular velocity
+        self.min_jerk_ang_vel = R_world_to_body @ (T.T_mat(self.min_jerk_orientation) @
+                                                   self.min_jerk_orientation_dot.T)
+
+        return
+
+    def _specify_constants(self):
+        """
+        EC
+        Assign constants in class variables
+
+        """
+        self.X_init = self.initial_position[0]
+        self.Y_init = self.initial_position[1]
+        self.Z_init = self.initial_position[2]
+
+        self.X_final = self.final_position[0]
+        self.Y_final = self.final_position[1]
+        self.Z_final = self.final_position[2]
+
+        self.min_jerk_position = None
+        self.min_jerk_velocity = None
+        self.min_jerk_acceleration = None
+        self.min_jerk_orientation = None
+        self.min_jerk_orientation_dot = None
+        self.min_jerk_ang_vel = None
+        self.min_jerk_ang_acc = None
+
+        self.min_jerk_position_vec = []
+        self.min_jerk_velocity_vec = []
+        self.min_jerk_acceleration_vec = []
+        self.min_jerk_orientation_vec = []
+        self.min_jerk_orientation_dot_vec = []
+        self.min_jerk_angle_velocity_vec = []
+
+        self.tfinal = 2  # this is for the minimum jerk
+        self.time = 0.0
+        self.time_vec = []
+        self.real_position = None
+        self.real_velocity = None
+        self.real_orientation = None
+        self.real_angle_velocity = None
+
+        self.real_position_vec = []
+        self.real_velocity_vec = []
+        self.real_orientation_vec = []
+        self.real_angle_velocity_vec = []
+
+        self.impedance_orientation = []
+
+        self.impedance_position_vec = []
+        self.impedance_velocity_vec = []
+        self.impedance_acceleration_vec = []
+        self.impedance_orientation_vec = []
+        self.impedance_angle_velocity_vec = []
 
     @abc.abstractmethod
     def run_controller(self):
@@ -131,28 +368,37 @@ class Controller(object, metaclass=abc.ABCMeta):
         """
 
         # Only run update if self.new_update or force flag is set
-        if self.new_update or force:
-            self.sim.forward()
+        # if self.new_update or force:
+        self.sim.forward()
 
-            self.ee_pos = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id(self.eef_name)])
-            self.ee_ori_mat = np.array(self.sim.data.site_xmat[self.sim.model.site_name2id(self.eef_name)].reshape([3, 3]))
-            self.ee_pos_vel = np.array(self.sim.data.site_xvelp[self.sim.model.site_name2id(self.eef_name)])
-            self.ee_ori_vel = np.array(self.sim.data.site_xvelr[self.sim.model.site_name2id(self.eef_name)])
+        self.time = self.sim.data.time
+        self.peg_edge = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("peg_site")])
+        self.ee_pos = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id(self.eef_name)])
+        self.ee_ori_mat = np.array(self.sim.data.site_xmat[self.sim.model.site_name2id(self.eef_name)].reshape([3, 3]))
+        self.ee_pos_vel = np.array(self.sim.data.site_xvelp[self.sim.model.site_name2id(self.eef_name)])
+        self.ee_ori_vel = np.array(self.sim.data.site_xvelr[self.sim.model.site_name2id(self.eef_name)])
 
-            self.joint_pos = np.array(self.sim.data.qpos[self.qpos_index])
-            self.joint_vel = np.array(self.sim.data.qvel[self.qvel_index])
+        self.joint_pos = np.array(self.sim.data.qpos[self.qpos_index])
+        self.joint_vel = np.array(self.sim.data.qvel[self.qvel_index])
 
-            self.J_pos = np.array(self.sim.data.get_site_jacp(self.eef_name).reshape((3, -1))[:, self.qvel_index])
-            self.J_ori = np.array(self.sim.data.get_site_jacr(self.eef_name).reshape((3, -1))[:, self.qvel_index])
-            self.J_full = np.array(np.vstack([self.J_pos, self.J_ori]))
+        self.J_pos = np.array(self.sim.data.get_site_jacp(self.eef_name).reshape((3, -1))[:, self.qvel_index])
+        self.J_ori = np.array(self.sim.data.get_site_jacr(self.eef_name).reshape((3, -1))[:, self.qvel_index])
+        self.J_full = np.array(np.vstack([self.J_pos, self.J_ori]))
 
-            mass_matrix = np.ndarray(shape=(len(self.sim.data.qvel) ** 2,), dtype=np.float64, order='C')
-            mujoco_py.cymj._mj_fullM(self.sim.model, mass_matrix, self.sim.data.qM)
-            mass_matrix = np.reshape(mass_matrix, (len(self.sim.data.qvel), len(self.sim.data.qvel)))
-            self.mass_matrix = mass_matrix[self.qvel_index, :][:, self.qvel_index]
+        mass_matrix = np.ndarray(shape=(len(self.sim.data.qvel) ** 2,), dtype=np.float64, order='C')
+        mujoco_py.cymj._mj_fullM(self.sim.model, mass_matrix, self.sim.data.qM)
+        mass_matrix = np.reshape(mass_matrix, (len(self.sim.data.qvel), len(self.sim.data.qvel)))
+        self.mass_matrix = mass_matrix[self.qvel_index, :][:, self.qvel_index]
 
-            # Clear self.new_update
-            self.new_update = False
+        # EC - force readings
+        # the forces needs to be transform to the world base frame
+        # the minus sign is because the measured forces are the forces that the robot apply on the environment
+        forces_world = np.dot(self.ee_ori_mat, -self.sim.data.sensordata[:3])
+        torques_world = np.dot(self.ee_ori_mat, -self.sim.data.sensordata[3:6])
+        self.interaction_forces = np.concatenate((forces_world, torques_world), axis=0)
+
+        # Clear self.new_update
+        self.new_update = False
 
     def update_base_pose(self, base_pos, base_ori):
         """
@@ -266,4 +512,272 @@ class Controller(object, metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    # EC
+    def add_path_parameter(self):
 
+        self.time_vec.append(self.time)
+
+        self.min_jerk_position_vec.append(self.min_jerk_position)
+        self.min_jerk_velocity_vec.append(self.min_jerk_velocity)
+        self.min_jerk_acceleration_vec.append(self.min_jerk_acceleration)
+        # self.min_jerk_orientation_vec.append(self.min_jerk_orientation)
+        self.min_jerk_orientation_vec.append(R.from_euler("xyz", self.min_jerk_orientation, degrees=False).as_rotvec())
+        self.min_jerk_orientation_dot_vec.append(self.min_jerk_orientation_dot)
+        self.min_jerk_angle_velocity_vec.append(self.min_jerk_ang_vel)
+
+        self.real_position_vec.append(self.real_position)
+        self.real_velocity_vec.append(self.real_velocity)
+        self.real_orientation_vec.append(self.real_orientation)
+        self.real_angle_velocity_vec.append(self.real_angle_velocity)
+        self.interaction_forces_vec.append(np.array(self.interaction_forces))
+
+    def plotter(self):
+
+        time = np.array(self.time_vec)
+        min_jerk_position = np.array(self.min_jerk_position_vec)
+        min_jerk_velocity = np.array(self.min_jerk_velocity_vec)
+        min_jerk_acceleration = np.array(self.min_jerk_acceleration_vec)
+        min_jerk_orientation = np.array(self.min_jerk_orientation_vec)
+        min_jerk_angle_velocity = np.array(self.min_jerk_angle_velocity_vec)
+
+        impedance_position = np.array(self.impedance_position_vec)
+        impedance_velocity = np.array(self.impedance_velocity_vec)
+        impedance_orientation = np.array(self.impedance_orientation_vec)
+        impedance_angle_velocity = np.array(self.impedance_angle_velocity_vec)
+
+        real_position = np.array(self.real_position_vec)
+        real_velocity = np.array(self.real_velocity_vec)
+        real_orientation = np.array(self.real_orientation_vec)
+        real_angle_velocity = np.array(self.real_angle_velocity_vec)
+        interaction_forces = np.array(self.interaction_forces_vec)
+        PD_force_command = np.array(self.PD_force_command)
+
+        plt.figure()
+
+        ax1 = plt.subplot(311)
+        ax1.plot(time, min_jerk_position[:, 0], 'g', label=" X reference")
+        ax1.plot(time, impedance_position[:, 0], 'b--', label=" X impedance")
+        ax1.plot(time, real_position[:, 0], 'r--', label=" X real")
+        ax1.legend()
+        ax1.set_title("X [m]")
+
+        ax2 = plt.subplot(312)
+        ax2.plot(time, min_jerk_position[:, 1], 'g', label=" Y reference")
+        ax2.plot(time, impedance_position[:, 1], 'b--', label=" Y impedance")
+        ax2.plot(time, real_position[:, 1], 'r--', label=" Y real")
+        ax2.legend()
+        ax2.set_title("Y [m]")
+
+        ax3 = plt.subplot(313)
+        ax3.plot(time, min_jerk_position[:, 2], 'g', label=" Z reference")
+        ax3.plot(time, impedance_position[:, 2], 'b--', label=" Z impedance")
+        ax3.plot(time, real_position[:, 2], 'r--', label=" Z real")
+        ax3.legend()
+        ax3.set_title("Z [m]")
+
+        plt.tight_layout()
+
+        # ----------------------------------------------------------------------
+        plt.figure()
+
+        ax1 = plt.subplot(311)
+        ax1.plot(time, min_jerk_velocity[:, 0], 'g', label="$\dot X$ minimum jerk")
+        ax1.plot(time, impedance_velocity[:, 0], 'b--', label="$\dot X$ impedance")
+        ax1.plot(time, real_velocity[:, 0], 'r--', label=" $\dot X$ real")
+        ax1.legend()
+        ax1.set_title("$\dot X$ [m/s]")
+
+        ax2 = plt.subplot(312)
+        ax2.plot(time, min_jerk_velocity[:, 1], 'g', label=" $\dot Y$ minimum jerk")
+        ax2.plot(time, impedance_velocity[:, 1], 'b--', label="$\dot X$ impedance")
+        ax2.plot(time, real_velocity[:, 1], 'r--', label=" $\dot Y$ real")
+        ax2.legend()
+        ax2.set_title("$\dot Y$ [m/s]")
+
+        ax3 = plt.subplot(313)
+        ax3.plot(time, min_jerk_velocity[:, 2], 'g', label=" $\dot Z$ minimum jerk")
+        ax3.plot(time, impedance_velocity[:, 2], 'b--', label="$\dot X$ impedance")
+        ax3.plot(time, real_velocity[:, 2], 'r--', label=" $\dot Z$ real")
+        ax3.legend()
+        ax3.set_title("$\dot Z$ [m/s]")
+
+        plt.tight_layout()
+        # ----------------------------------------------------------------------
+        plt.figure()
+
+        ax1 = plt.subplot(311)
+        ax1.plot(time, min_jerk_orientation[:, 0], 'g', label="orientation 1st element - minimum jerk")
+        ax1.plot(time, impedance_orientation[:, 0], 'b--', label="orientation 1st element - impedance")
+        ax1.plot(time, real_orientation[:, 0], 'r--', label="orientation 1st element - real")
+        ax1.legend()
+        ax1.set_title("orientation 1st element")
+
+        ax2 = plt.subplot(312)
+        ax2.plot(time, min_jerk_orientation[:, 1], 'g', label="orientation 2nd element - minimum jerk")
+        ax2.plot(time, impedance_orientation[:, 1], 'b--', label="orientation 2nd element - impedance")
+        ax2.plot(time, real_orientation[:, 1], 'r--', label="orientation 2nd element - real")
+        ax2.legend()
+        ax2.set_title("orientation 2nd element")
+
+        ax3 = plt.subplot(313)
+        ax3.plot(time, min_jerk_orientation[:, 2], 'g', label="orientation 3rd element - minimum jerk")
+        ax3.plot(time, impedance_orientation[:, 2], 'b--', label="orientation 3rd element - impedance")
+        ax3.plot(time, real_orientation[:, 2], 'r--', label="orientation 3rd element - real")
+        ax3.legend()
+        ax3.set_title("orientation 3rd element")
+
+        plt.tight_layout()
+        # -------------------------------------------------------------
+        plt.figure()
+
+        ax1 = plt.subplot(311)
+        ax1.plot(time, min_jerk_angle_velocity[:, 0], 'g', label="Wx - minimum jerk")
+        ax1.plot(time, impedance_angle_velocity[:, 0], 'b--', label="orientation 1st element - impedance")
+        ax1.plot(time, real_angle_velocity[:, 0], 'r--', label="Wx  - real")
+        ax1.legend()
+        ax1.set_title("Wx")
+
+        ax2 = plt.subplot(312)
+        ax2.plot(time, min_jerk_angle_velocity[:, 1], 'g', label="Wy - minimum jerk")
+        ax2.plot(time, impedance_angle_velocity[:, 1], 'b--', label="orientation 2nd element - impedance")
+        ax2.plot(time, real_angle_velocity[:, 1], 'r--', label="Wy - real")
+        ax2.legend()
+        ax2.set_title("Wy")
+
+        ax3 = plt.subplot(313)
+        ax3.plot(time, min_jerk_angle_velocity[:, 2], 'g', label="Wz - minimum jerk")
+        ax3.plot(time, impedance_angle_velocity[:, 2], 'b--', label="orientation 3rd element - impedance")
+        ax3.plot(time, real_angle_velocity[:, 2], 'r--', label="Wz - real")
+        ax3.legend()
+        ax3.set_title("Wz")
+
+        plt.tight_layout()
+        # -------------------------------------------------------------
+        plt.figure()
+
+        ax1 = plt.subplot(311)
+        ax1.plot(time, interaction_forces[:, 0], 'r--', label="from sensor")
+        ax1.plot(time, PD_force_command[:, 0], 'g--', label="from PD")
+        ax1.legend()
+        ax1.set_title("Fx [N]")
+
+        ax2 = plt.subplot(312)
+        ax2.plot(time, interaction_forces[:, 1], 'r--', label="from sensor")
+        ax2.plot(time, PD_force_command[:, 1], 'g--', label="from PD")
+        ax2.legend()
+        ax2.set_title("Fy [N]")
+
+        ax3 = plt.subplot(313)
+        ax3.plot(time, interaction_forces[:, 1], 'r--', label="from sensor")
+        ax3.plot(time, PD_force_command[:, 1], 'g--', label="from PD")
+        ax3.legend()
+        ax3.set_title("Fz [N]")
+
+        plt.tight_layout()
+        # -------------------------------------------------------------
+        plt.figure()
+
+        ax1 = plt.subplot(311)
+        ax1.plot(time, interaction_forces[:, 3], 'r--', label="from sensor")
+        ax1.plot(time, PD_force_command[:, 3], 'g--', label="from PD")
+        ax1.legend()
+        ax1.set_title("Mx [Nm]")
+
+        ax2 = plt.subplot(312)
+        ax2.plot(time, interaction_forces[:, 4], 'r--', label="from sensor")
+        ax2.plot(time, PD_force_command[:, 4], 'g--', label="from PD")
+        ax2.legend()
+        ax2.set_title("My [Nm]")
+
+        ax3 = plt.subplot(313)
+        ax3.plot(time, interaction_forces[:, 5], 'r--', label="from sensor")
+        ax3.plot(time, PD_force_command[:, 5], 'g--', label="from PD")
+        ax3.legend()
+        ax3.set_title("Mz [Nm]")
+
+        plt.tight_layout()
+
+        # plt.show()
+
+        # contact_time = self.contact_time
+        # contact_index = np.where(np.array(time) == contact_time)
+        # contact_index = int(contact_index[0])
+        # time = time[contact_index:]
+        # t = np.array(time)
+        # K = self.K
+        # M = self.M
+        # C = self.C
+        # FT = np.array(self.desired_frame_FT_vec)
+        # F = FT[:, 1]
+        # # F = FT[:, 3]
+        # y0 = [0, 0]
+        # pos = np.array(self.desired_frame_imp_position_vec)
+        # ori = np.array(self.desired_frame_imp_ori_vec)
+        # vel = np.array(self.desired_frame_imp_vel_vec)
+        # ang_vel = np.array(self.desired_frame_imp_ang_vel_vec)
+        #
+        # sol = odeint(self.pend, y0, t, args=(F, time, K, C, M))
+        # plt.figure()
+        # plt.plot(t, sol[:, 0], 'b', label='pos from ODE')
+        # plt.plot(time, pos[:, 1], 'g',
+        #          label='from simulation')
+        # # plt.plot(time, ori[:, 0], 'g',
+        # #          label='from simulation')
+        # # plt.plot(time, min_jerk_position[contact_index:, 0] - impedance_position[contact_index:, 0], 'g',
+        # #          label='from simulation')
+        # plt.legend(loc='best')
+        # plt.xlabel('t')
+        # plt.grid()
+        #
+        # plt.figure()
+        # plt.plot(t, sol[:, 1], 'b', label='vel from ODE')
+        # plt.plot(time, vel[:, 1],
+        #          'g',
+        #          label='from simulation')
+        # # plt.plot(time, ang_vel[:, 0],
+        # #          'g',
+        # #          label='from simulation')
+        # plt.legend(loc='best')
+        # plt.xlabel('t')
+        # plt.grid()
+        plt.show()
+        return
+
+    def pend(self, y, t, F, time, K, C, M):
+        x, x_dot = y
+        f_interp = interp1d(time, F, axis=0, fill_value="extrapolate")
+        f = f_interp(t)
+        dydt = [x_dot, -K / M * x - C / M * x_dot + f / M]
+        return dydt
+
+    # EC
+    def get_path_info(self):
+        """
+
+        Returns:
+
+        """
+        info = {
+            "time": self.time_vec,
+            "min_jerk_position_vec": self.min_jerk_position_vec,
+            "min_jerk_velocity_vec": self.min_jerk_velocity_vec,
+            "min_jerk_acceleration_vec": self.min_jerk_acceleration_vec,
+            "min_jerk_orientation_vec": self.min_jerk_orientation_vec,
+            "min_jerk_angle_velocity_vec": self.min_jerk_angle_velocity_vec,
+            "impedance_position_vec": self.impedance_position_vec,
+            "impedance_velocity_vec": self.impedance_velocity_vec,
+            "impedance_orientation_vec": self.impedance_orientation_vec,
+            "impedance_angle_velocity_vec": self.impedance_angle_velocity_vec,
+            "real_position_vec": self.real_position_vec,
+            "real_velocity_vec": self.real_velocity_vec,
+            "real_orientation_vec": self.real_orientation_vec,
+            "real_angle_velocity_vec": self.real_angle_velocity_vec,
+            "interaction_forces_vec": self.interaction_forces_vec,
+            "K_imp": self.K,
+            "M_imp": self.M,
+            "C_imp": self.C,
+            "contact_time": self.contact_time,
+            "min_jerk_orientation_dot": self.min_jerk_orientation_dot_vec,
+        }
+
+        return info

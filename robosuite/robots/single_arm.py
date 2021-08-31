@@ -281,6 +281,16 @@ class SingleArm(Manipulator):
             ee_acc = np.array([np.convolve(col, np.ones(10) / 10., mode='valid')[0] for col in diffs.transpose()])
             self.recent_ee_acc.push(ee_acc)
 
+    # EC -  get all path information
+    def get_path_info(self):
+        """
+
+        Returns:
+
+        """
+        info = self.controller.get_path_info()
+        return info
+
     def _visualize_grippers(self, visible):
         """
         Visualizes the gripper site(s) if applicable.
