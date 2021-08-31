@@ -141,3 +141,14 @@ class GymWrapper(Wrapper, Env):
         """
         # Dummy args used to mimic Wrapper interface
         return self.env.reward()
+
+    # EC -  get all path information
+    def get_path_info(self):
+        """
+
+        Returns: path information
+
+        """
+        # Dummy args used to mimic Wrapper interface
+        info = self.env.get_path_info()
+        return info

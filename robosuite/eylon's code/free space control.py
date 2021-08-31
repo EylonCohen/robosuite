@@ -49,67 +49,23 @@ from robosuite.controllers import load_controller_config
 from robosuite.utils.input_utils import *
 from robosuite.robots import Bimanual
 
-
 if __name__ == "__main__":
 
     # Create dict to hold options that will be passed to env creation call
-    options = {}
-
-    # print welcome info
-    print("Welcome to robosuite v{}!".format(suite.__version__))
-    print(suite.__logo__)
+    options = {"env_name": "Lift", "robots": "UR5e"}
 
     # Choose environment and add it to options
-    options["env_name"] = choose_environment()
-
-    # If a multi-arm environment has been chosen, choose configuration and appropriate robot(s)
-    if "TwoArm" in options["env_name"]:
-        # Choose env config and add it to options
-        options["env_configuration"] = choose_multi_arm_config()
-
-        # If chosen configuration was bimanual, the corresponding robot must be Baxter. Else, have user choose robots
-        if options["env_configuration"] == 'bimanual':
-            options["robots"] = 'Baxter'
-        else:
-            options["robots"] = []
-
-            # Have user choose two robots
-            print("A multiple single-arm configuration was chosen.\n")
-
-            for i in range(2):
-                print("Please choose Robot {}...\n".format(i))
-                options["robots"].append(choose_robots(exclude_bimanual=True))
-
-    # Else, we simply choose a single (single-armed) robot to instantiate in the environment
-    else:
-        options["robots"] = choose_robots(exclude_bimanual=True)
-
-    # Hacky way to grab joint dimension for now
-    joint_dim = 6 if options["robots"] == "UR5e" else 7
-
-    # Choose controller
-    controller_name = choose_controller()
-
+    joint_dim = 6
+    controller_name = "JOINT_TORQUE"
     # Load the desired controller
     options["controller_configs"] = suite.load_controller_config(default_controller=controller_name)
 
-    # Define the pre-defined controller actions to use (action_dim, num_test_steps, test_value)
-    controller_settings = {
-        "OSC_POSE":         [6, 6, 0.1],
-        "OSC_POSITION":     [3, 3, 0.1],
-        "IK_POSE":          [6, 6, 0.01],
-        "JOINT_POSITION":   [joint_dim, joint_dim, 0.2],
-        #"JOINT_VELOCITY":   [joint_dim, joint_dim, -0.1],
-        "JOINT_VELOCITY": [joint_dim, joint_dim, -100], # EC
-        "JOINT_TORQUE":     [joint_dim, joint_dim, 0.25]
-    }
-
     # Define variables for each controller test
-    action_dim = controller_settings[controller_name][0]
-    num_test_steps = controller_settings[controller_name][1]
-    test_value = controller_settings[controller_name][2]
+    action_dim = joint_dim
+    num_test_steps = joint_dim
+    test_value = 0.25
 
-    # Define the number of timesteps to use per controller action as well as timesteps in between actions
+    # Define the number of timestamps to use per controller action as well as timestamps in between actions
     steps_per_action = 75
     steps_per_rest = 75
 
@@ -125,8 +81,8 @@ if __name__ == "__main__":
         ignore_done=True,
         use_camera_obs=False,
         horizon=(steps_per_action + steps_per_rest) * num_test_steps,
-        #control_freq=20,
-        control_freq=100, # EC
+        # control_freq=20,
+        control_freq=50,  # EC
     )
     env.reset()
     env.viewer.set_camera(camera_id=0)
@@ -147,21 +103,17 @@ if __name__ == "__main__":
     # Loop through controller space
     while count < num_test_steps:
         action = neutral.copy()
-        for i in range(steps_per_action):
-            if controller_name in {'IK_POSE', 'OSC_POSE'} and count > 2:
-                # Set this value to be the scaled axis angle vector
-                vec = np.zeros(3)
-                vec[count - 3] = test_value
-                action[3:6] = vec
-            else:
-                action[count] = test_value
-            total_action = np.tile(action, n)
-            env.step(total_action)
-            env.render()
-        for i in range(steps_per_rest):
-            total_action = np.tile(neutral, n)
-            env.step(total_action)
-            env.render()
+        # for i in range(steps_per_action):
+        #     action[count] = test_value
+        #     total_action = np.tile(action, n)
+        #     env.step(total_action)
+        #     env.render()
+        # for i in range(steps_per_rest):
+        #     total_action = np.tile(neutral, n)
+        #     env.step(total_action)
+        #     env.render()
+        env.step(action)
+        env.render()
         count += 1
 
     # Shut down this env before starting the next test

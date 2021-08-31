@@ -1,19 +1,21 @@
+import collections
 from collections import OrderedDict
 import numpy as np
+import robosuite.utils.transform_utils as T
 
 from robosuite.utils.transform_utils import convert_quat
-from robosuite.utils.mjcf_utils import CustomMaterial
+from robosuite.utils.mjcf_utils import CustomMaterial, array_to_string, new_site, find_elements
 
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 
 from robosuite.models.arenas import TableArena
-from robosuite.models.objects import BoxObject
+from robosuite.models.objects import BoxObject, PlateWithHoleObject, CylinderObject
 from robosuite.models.tasks import ManipulationTask
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.observables import Observable, sensor
 
 
-class Lift(SingleArmEnv):
+class PegInHole(SingleArmEnv):
     """
     This class corresponds to the lifting task for a single robot arm.
 
@@ -123,38 +125,59 @@ class Lift(SingleArmEnv):
     """
 
     def __init__(
-        self,
-        robots,
-        env_configuration="default",
-        controller_configs=None,
-        gripper_types="default",
-        initialization_noise="default",
-        table_full_size=(0.8, 0.8, 0.05),
-        table_friction=(1., 5e-3, 1e-4),
-        use_camera_obs=True,
-        use_object_obs=True,
-        reward_scale=1.0,
-        reward_shaping=False,
-        placement_initializer=None,
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        render_camera="frontview",
-        render_collision_mesh=False,
-        render_visual_mesh=True,
-        render_gpu_device_id=-1,
-        control_freq=None,
-        horizon=None,
-        ignore_done=False,
-        hard_reset=True,
-        camera_names="agentview",
-        camera_heights=256,
-        camera_widths=256,
-        camera_depths=False,
+            self,
+            robots,
+            env_configuration="default",
+            user_init_qpos=None,
+            controller_configs=None,
+            gripper_types="default",
+            initialization_noise="default",
+            table_full_size=(0.8, 0.8, 0.05),
+            table_friction=(1., 5e-3, 1e-4),
+            table_height=0.8,
+            use_camera_obs=True,
+            use_object_obs=True,
+            reward_scale=1.0,
+            reward_shaping=False,
+            placement_initializer=None,
+            has_renderer=False,
+            has_offscreen_renderer=True,
+            render_camera="frontview",
+            render_collision_mesh=False,
+            render_visual_mesh=True,
+            render_gpu_device_id=-1,
+            control_freq=20,
+            horizon=1000,
+            ignore_done=False,
+            hard_reset=True,
+            camera_names="agentview",
+            camera_heights=256,
+            camera_widths=256,
+            camera_depths=False,
+            num_via_point=0,
+            dist_error=0.002,
+            angle_error=0,
+            tanh_value=2.0,
+            r_reach_value=0.94,
+            error_type='circle',
+            control_spec=36,
+            peg_radius=0.015,  # (0.00125, 0.00125)
+            peg_length=0.08,  # it is actually half of the peg length
+            Peg_density=1,
     ):
         # settings for table top
         self.table_full_size = table_full_size
         self.table_friction = table_friction
-        self.table_offset = np.array((0, 0, 0.8))
+        self.table_height = table_height
+        self.table_offset = np.array((0, 0, self.table_height))
+
+        # Save peg specs
+        self.peg_radius = peg_radius
+        self.peg_length = peg_length
+        self.Peg_density = Peg_density
+
+        self.dist_error = dist_error
+        self.angle_error = angle_error
 
         # reward configuration
         self.reward_scale = reward_scale
@@ -166,10 +189,15 @@ class Lift(SingleArmEnv):
         # object placement initializer
         self.placement_initializer = placement_initializer
 
+        # EC - define desired initial joint position
+        self.user_init_qpos = user_init_qpos
+
+
         super().__init__(
             robots=robots,
             env_configuration=env_configuration,
             controller_configs=controller_configs,
+            user_init_qpos=self.user_init_qpos,
             mount_types="default",
             gripper_types=gripper_types,
             initialization_noise=initialization_noise,
@@ -188,7 +216,10 @@ class Lift(SingleArmEnv):
             camera_heights=camera_heights,
             camera_widths=camera_widths,
             camera_depths=camera_depths,
+
         )
+
+
 
     def reward(self, action=None):
         """
@@ -216,28 +247,28 @@ class Lift(SingleArmEnv):
             float: reward value
         """
         reward = 0.
-
-        # sparse completion reward
-        if self._check_success():
-            reward = 2.25
-
-        # use a shaping reward
-        elif self.reward_shaping:
-
-            # reaching reward
-            cube_pos = self.sim.data.body_xpos[self.cube_body_id]
-            gripper_site_pos = self.sim.data.site_xpos[self.robots[0].eef_site_id]
-            dist = np.linalg.norm(gripper_site_pos - cube_pos)
-            reaching_reward = 1 - np.tanh(10.0 * dist)
-            reward += reaching_reward
-
-            # grasping reward
-            if self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cube):
-                reward += 0.25
-
-        # Scale reward if requested
-        if self.reward_scale is not None:
-            reward *= self.reward_scale / 2.25
+        #
+        # # sparse completion reward
+        # if self._check_success():
+        #     reward = 2.25
+        #
+        # # use a shaping reward
+        # elif self.reward_shaping:
+        #
+        #     # reaching reward
+        #     cube_pos = self.sim.data.body_xpos[self.cube_body_id]
+        #     gripper_site_pos = self.sim.data.site_xpos[self.robots[0].eef_site_id]
+        #     dist = np.linalg.norm(gripper_site_pos - cube_pos)
+        #     reaching_reward = 1 - np.tanh(10.0 * dist)
+        #     reward += reaching_reward
+        #
+        #     # grasping reward
+        #     if self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cube):
+        #         reward += 0.25
+        #
+        # # Scale reward if requested
+        # if self.reward_scale is not None:
+        #     reward *= self.reward_scale / 2.25
 
         return reward
 
@@ -248,6 +279,7 @@ class Lift(SingleArmEnv):
         super()._load_model()
 
         # Adjust base pose accordingly
+        
         xpos = self.robots[0].robot_model.base_xpos_offset["table"](self.table_full_size[0])
         self.robots[0].robot_model.set_base_xpos(xpos)
 
@@ -260,54 +292,61 @@ class Lift(SingleArmEnv):
 
         # Arena always gets set to zero origin
         mujoco_arena.set_origin([0, 0, 0])
+        self.rotation = None
+        x_range = [-0.0, 0.0]
+        y_range = [-0.1, -0.1]
 
         # initialize objects of interest
-        tex_attrib = {
-            "type": "cube",
-        }
-        mat_attrib = {
-            "texrepeat": "1 1",
-            "specular": "0.4",
-            "shininess": "0.1",
-        }
-        redwood = CustomMaterial(
-            texture="WoodRed",
-            tex_name="redwood",
-            mat_name="redwood_mat",
-            tex_attrib=tex_attrib,
-            mat_attrib=mat_attrib,
-        )
-        self.cube = BoxObject(
-            name="cube",
-            size_min=[0.020, 0.020, 0.020],  # [0.015, 0.015, 0.015],
-            size_max=[0.022, 0.022, 0.022],  # [0.018, 0.018, 0.018])
-            rgba=[1, 0, 0, 1],
-            material=redwood,
-        )
+        self.peg = CylinderObject(name='peg',
+                                  size=[self.peg_radius, self.peg_length],
+                                  density=self.Peg_density,
+                                  duplicate_collision_geoms=True,
+                                  rgba=[1, 0, 0, 1], joints=None)
 
-        # Create placement initializer
-        if self.placement_initializer is not None:
-            self.placement_initializer.reset()
-            self.placement_initializer.add_objects(self.cube)
-        else:
-            self.placement_initializer = UniformRandomSampler(
-                name="ObjectSampler",
-                mujoco_objects=self.cube,
-                x_range=[-0.03, 0.03],
-                y_range=[-0.03, 0.03],
-                rotation=None,
-                ensure_object_boundary_in_range=False,
-                ensure_valid_placement=True,
-                reference_pos=self.table_offset,
-                z_offset=0.01,
+        # load peg object (returns extracted object in XML form)
+        peg_obj = self.peg.get_obj()
+        # set pegs position relative to place where it is being placed
+        peg_obj.set("pos", array_to_string((0, 0, 0.145)))  # 0.145 is the middle of the fingers
+        peg_obj.append(new_site(name="peg_site", pos=(0, 0, self.peg_length), size=(0.0002,)))
+        # append the object top the gripper (attach body to body)
+        # main_eef = self.robots[0].robot_model.eef_name    # 'robot0_right_hand'
+        main_eef = self.robots[0].gripper.bodies[1]  # 'gripper0_eef' body
+        main_model = self.robots[
+            0].robot_model  # <robosuite.models.robots.manipulators.ur5e_robot.UR5e at 0x7fd9ead87ca0>
+        main_body = find_elements(root=main_model.worldbody, tags="body", attribs={"name": main_eef}, return_first=True)
+        main_body.append(peg_obj)  # attach body to body
+
+        if self.rotation is None:
+            rot_angle = np.random.uniform(high=2 * np.pi, low=0)
+        elif isinstance(self.rotation, collections.Iterable):
+            rot_angle = np.random.uniform(
+                high=max(self.rotation), low=min(self.rotation)
             )
+        else:
+            rot_angle = self.rotation
 
-        # task includes arena, robot, and objects of interest
+        hole_rot_set = str(np.array([np.cos(rot_angle / 2), 0, 0, np.sin(rot_angle / 2)]))
+        # hole_pos_set = np.array(
+        #     [np.random.uniform(high=x_range[0], low=x_range[1]), np.random.uniform(high=y_range[0], low=y_range[1]),
+        #      self.table_height])
+        hole_pos_set = np.array([0, -0.2, self.table_height])
+        hole_pos_str = ' '.join(map(str, hole_pos_set))
+        hole_rot_str = ' '.join(map(str, hole_rot_set))
+
+        self.hole = PlateWithHoleObject(name='hole')
+        hole_obj = self.hole.get_obj()
+        hole_obj.set("quat", hole_rot_str)
+        hole_obj.set("pos", hole_pos_str)
+
         self.model = ManipulationTask(
             mujoco_arena=mujoco_arena,
-            mujoco_robots=[robot.robot_model for robot in self.robots], 
-            mujoco_objects=self.cube,
+            mujoco_robots=[robot.robot_model for robot in self.robots],
+            mujoco_objects=self.hole
         )
+
+        # Make sure to add relevant assets from peg and hole objects
+        self.model.merge_assets(self.peg)
+        # print(self.model.get_xml())
 
     def _setup_references(self):
         """
@@ -318,12 +357,11 @@ class Lift(SingleArmEnv):
         super()._setup_references()
 
         # Additional object references from this env
-        self.cube_body_id = self.sim.model.body_name2id(self.cube.root_body)
+        self.peg_body_id = self.sim.model.body_name2id(self.peg.root_body)
 
     def _setup_observables(self):
         """
         Sets up observables to be used for this environment. Creates object-based observables if enabled
-
         Returns:
             OrderedDict: Dictionary mapping observable names to its corresponding Observable object
         """
@@ -335,21 +373,21 @@ class Lift(SingleArmEnv):
             pf = self.robots[0].robot_model.naming_prefix
             modality = "object"
 
-            # cube-related observables
+            # peg-related observables
             @sensor(modality=modality)
-            def cube_pos(obs_cache):
-                return np.array(self.sim.data.body_xpos[self.cube_body_id])
+            def peg_pos(obs_cache):
+                return np.array(self.sim.data.body_xpos[self.peg_body_id])
 
             @sensor(modality=modality)
-            def cube_quat(obs_cache):
-                return convert_quat(np.array(self.sim.data.body_xquat[self.cube_body_id]), to="xyzw")
+            def peg_quat(obs_cache):
+                return T.convert_quat(np.array(self.sim.data.body_xquat[self.peg_body_id]), to="xyzw")
 
             @sensor(modality=modality)
-            def gripper_to_cube_pos(obs_cache):
-                return obs_cache[f"{pf}eef_pos"] - obs_cache["cube_pos"] if \
-                    f"{pf}eef_pos" in obs_cache and "cube_pos" in obs_cache else np.zeros(3)
+            def gripper_to_peg_pos(obs_cache):
+                return obs_cache[f"{pf}eef_pos"] - obs_cache["peg_pos"] if \
+                    f"{pf}eef_pos" in obs_cache and "peg_pos" in obs_cache else np.zeros(3)
 
-            sensors = [cube_pos, cube_quat, gripper_to_cube_pos]
+            sensors = [peg_pos, peg_quat, gripper_to_peg_pos]
             names = [s.__name__ for s in sensors]
 
             # Create observables
@@ -367,16 +405,15 @@ class Lift(SingleArmEnv):
         Resets simulation internal configurations.
         """
         super()._reset_internal()
-
-        # Reset all object positions using initializer sampler if we're not directly loading from an xml
-        if not self.deterministic_reset:
-
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
-
-            # Loop through all objects and reset their positions
-            for obj_pos, obj_quat, obj in object_placements.values():
-                self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+        # # Reset all object positions using initializer sampler if we're not directly loading from an xml
+        # if not self.deterministic_reset:
+        #
+        #     # Sample from the placement initializer for all objects
+        #     object_placements = self.placement_initializer.sample()
+        #
+        #     # Loop through all objects and reset their positions
+        #     for obj_pos, obj_quat, obj in object_placements.values():
+        #         self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
     def visualize(self, vis_settings):
         """
@@ -392,7 +429,7 @@ class Lift(SingleArmEnv):
 
         # Color the gripper visualization site according to its distance to the cube
         if vis_settings["grippers"]:
-            self._visualize_gripper_to_target(gripper=self.robots[0].gripper, target=self.cube)
+            self._visualize_gripper_to_target(gripper=self.robots[0].gripper, target=self.peg)
 
     def _check_success(self):
         """
@@ -401,8 +438,9 @@ class Lift(SingleArmEnv):
         Returns:
             bool: True if cube has been lifted
         """
-        cube_height = self.sim.data.body_xpos[self.cube_body_id][2]
-        table_height = self.model.mujoco_arena.table_offset[2]
-
-        # cube is higher than the table top above a margin
-        return cube_height > table_height + 0.04
+        # cube_height = self.sim.data.body_xpos[self.cube_body_id][2]
+        # table_height = self.model.mujoco_arena.table_offset[2]
+        #
+        # # cube is higher than the table top above a margin
+        # return cube_height > table_height + 0.04
+        return 1

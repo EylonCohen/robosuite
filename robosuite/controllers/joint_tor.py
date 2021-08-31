@@ -1,5 +1,11 @@
+from copy import deepcopy
+
 from robosuite.controllers.base_controller import Controller
 import numpy as np
+import robosuite.utils.angle_transformation as at
+from robosuite.utils.control_utils import opspace_matrices
+from scipy.spatial.transform import Rotation as R
+import robosuite.utils.transform_utils as T
 
 
 class JointTorqueController(Controller):
@@ -64,10 +70,14 @@ class JointTorqueController(Controller):
                  input_min=-1,
                  output_max=0.05,
                  output_min=-0.05,
-                 policy_freq=20,
+                 policy_freq=None,
                  torque_limits=None,
                  interpolator=None,
-                 **kwargs  # does nothing; used so no error raised when dict is passed with extra terms used previously
+                 plotting=False,
+                 collect_data=False,
+                 simulation_total_time=None,
+                 **kwargs,  # does nothing; used so no error raised when dict is passed with extra terms used previously
+
                  ):
 
         super().__init__(
@@ -75,6 +85,9 @@ class JointTorqueController(Controller):
             eef_name,
             joint_indexes,
             actuator_range,
+            plotting,
+            collect_data,
+            simulation_total_time,
         )
 
         # Control dimension
@@ -87,7 +100,8 @@ class JointTorqueController(Controller):
         self.output_min = self.nums2array(output_min, self.control_dim)
 
         # limits (if not specified, set them to actuator limits by default)
-        self.torque_limits = np.array(torque_limits) if torque_limits is not None else self.actuator_limits
+        # self.torque_limits = np.array(torque_limits) if torque_limits is not None else self.actuator_limits
+        self.torque_limits = self.actuator_limits
 
         # control frequency
         self.control_freq = policy_freq
@@ -96,9 +110,10 @@ class JointTorqueController(Controller):
         self.interpolator = interpolator
 
         # initialize torques
-        self.goal_torque = None                           # Goal torque desired, pre-compensation
+        self.goal_torque = None  # Goal torque desired, pre-compensation
         self.current_torque = np.zeros(self.control_dim)  # Current torques being outputted, pre-compensation
-        self.torques = None                               # Torques returned every time run_controller is called
+        self.torques = None  # Torques returned every time run_controller is called
+
 
     def set_goal(self, torques):
         """
@@ -111,15 +126,9 @@ class JointTorqueController(Controller):
             AssertionError: [Invalid action dimension size]
         """
         # Update state
-        self.update()
+        # self.update()
 
-        # Check to make sure torques is size self.joint_dim
-        assert len(torques) == self.control_dim, "Delta torque must be equal to the robot's joint dimension space!"
-
-        self.goal_torque = np.clip(self.scale_action(torques), self.torque_limits[0], self.torque_limits[1])
-
-        if self.interpolator is not None:
-            self.interpolator.set_goal(self.goal_torque)
+        self.goal_torque = np.zeros(self.control_dim)  # just for sending something. it doesn't matter
 
     def run_controller(self):
         """
@@ -134,17 +143,46 @@ class JointTorqueController(Controller):
 
         # Update state
         self.update()
+        # EC - calculate minimum jerk path
+        if self.time <= self.tfinal:
+            self._min_jerk()
 
-        # Only linear interpolator is currently supported
-        if self.interpolator is not None:
-            # Linear case
-            if self.interpolator.order == 1:
-                self.current_torque = self.interpolator.get_interpolated_goal()
-            else:
-                # Nonlinear case not currently supported
-                pass
+        # check the if the any axis force is greater then some value
+        if any(abs(self.interaction_forces) > 50):
+            self.is_contact = True
+
+        if self.is_contact:
+            if self.first_contact:
+                self.first_contact = False
+                self.contact_time = self.time
+                self.X_m = deepcopy(np.concatenate((np.zeros(3, ), np.zeros(3, ), np.zeros(3, ), np.zeros(3, ))))
+
+            self.impedance_computations()
+            Rotation_world_to_desired = R.from_euler("xyz", self.min_jerk_orientation, degrees=False).as_matrix()
+            compliance_position_relative_to_desired = (self.X_m[:3]).reshape(3, )
+            compliance_velocity_relative_to_desired = (self.X_m[6:9]).reshape(3, )
+            compliance_rotVec_relative_to_desired = (self.X_m[3:6]).reshape(3, )
+            compliance_ang_velocity_relative_to_desired = (self.X_m[9:12]).reshape(3, )
+
+            compliance_position = Rotation_world_to_desired @ compliance_position_relative_to_desired + \
+                                  self.min_jerk_position
+
+            Rotation_desired_to_compliance = R.from_rotvec(compliance_rotVec_relative_to_desired).as_matrix()
+            Rotation_world_to_compliance = Rotation_world_to_desired @ Rotation_desired_to_compliance
+
+            compliance_velocity = Rotation_world_to_desired @ compliance_velocity_relative_to_desired \
+                                  + self.min_jerk_velocity
+
+            compliance_ang_velocity = Rotation_world_to_desired @ compliance_ang_velocity_relative_to_desired \
+                                      + self.min_jerk_ang_vel
+
+            self.PD_control(compliance_position, Rotation_world_to_compliance,
+                            compliance_velocity, compliance_ang_velocity)
+            # compute the values of self.current_torque based on the impedance parameters
         else:
-            self.current_torque = np.array(self.goal_torque)
+            self.PD_control(self.min_jerk_position, R.from_euler("xyz", self.min_jerk_orientation, degrees=False)
+                            .as_matrix(), self.min_jerk_velocity, self.min_jerk_ang_vel)
+            # compute the values of self.current_torque based on the minimum jerk trajectory
 
         # Add gravity compensation
         self.torques = self.current_torque + self.torque_compensation
@@ -168,3 +206,93 @@ class JointTorqueController(Controller):
     @property
     def name(self):
         return 'JOINT_TORQUE'
+
+    def PD_control(self, desired_position, desired_orientation, desired_velocity, desired_angle_velocity):
+        # EC - compute the error between desired values and real values
+        # desired_orientation needs to be a rotation matrix!
+        position_error = desired_position - self.ee_pos
+
+        orientation_error = at.Rotation_Matrix_To_Vector(self.ee_ori_mat, desired_orientation)
+
+        velocity_error = desired_velocity - self.ee_pos_vel
+        rotational_velocity_error = (desired_angle_velocity - self.ee_ori_vel)
+
+        error = np.concatenate((position_error, orientation_error), axis=0)
+        error_dot = np.concatenate((velocity_error, rotational_velocity_error), axis=0)
+
+        # desired_acceleration = np.concatenate((self.desired_acceleration, desired_angle_acceleration), axis=0)
+
+        # only for J_T*F - no lambda
+        # Kp = 700
+        # zeta_pd = 0.707
+        # Kd = 2 * zeta_pd * np.sqrt(Kp)
+
+        Kp_pos = 1 * 4500 * np.ones(3)
+        Kp_ori = 2 * 4500 * np.ones(3)
+        Kp = np.append(Kp_pos, Kp_ori)
+
+        Kd_pos = 0.707 * 2 * np.sqrt(Kp_pos)
+        Kd_ori = 2 * 0.75 * 0.707 * 2 * np.sqrt(Kp_ori)
+        Kd = np.append(Kd_pos, Kd_ori)
+
+        # decoupled_wrench = -desired_acceleration + Kp * error + Kd * error_dot
+        wrench = Kp * error + Kd * error_dot
+
+        # Compute nullspace matrix (I - Jbar * J) and lambda matrices ((J * M^-1 * J^T)^-1)
+        lambda_full, lambda_pos, lambda_ori, nullspace_matrix = opspace_matrices(self.mass_matrix,
+                                                                                 self.J_full,
+                                                                                 self.J_pos,
+                                                                                 self.J_ori)
+        decoupled_wrench = np.dot(lambda_full, wrench)
+        torques = np.dot(self.J_full.T, decoupled_wrench) #- (np.dot(self.J_full.T, self.sim.data.sensordata)) * self.is_contact
+
+        # torques = np.dot(self.J_full.T, wrench)# - (np.dot(self.J_full.T, self.interaction_forces)) * self.is_contact
+        assert len(torques) == self.control_dim, "Delta torque must be equal to the robot's joint dimension space!"
+
+        # make the robot work under torque limitations
+        self.goal_torque = np.clip(torques, self.torque_limits[0], self.torque_limits[1])
+        self.goal_torque = torques
+
+        # EC - take measurements for graphs
+        if self.collect_data:
+            self.real_position = self.ee_pos
+            self.real_velocity = self.ee_pos_vel
+            if self.time == 0:
+                self.real_orientation = R.from_matrix(self.ee_ori_mat).as_rotvec()
+            elif np.dot(R.from_matrix(self.ee_ori_mat).as_rotvec(), self.real_orientation) > 0:
+                self.real_orientation = R.from_matrix(self.ee_ori_mat).as_rotvec()
+            elif np.dot(R.from_matrix(self.ee_ori_mat).as_rotvec(), self.real_orientation) <= 0:
+                self.real_orientation = -1 * R.from_matrix(self.ee_ori_mat).as_rotvec()
+            self.real_angle_velocity = self.ee_ori_vel
+
+            self.impedance_position_vec.append(desired_position)
+            self.impedance_velocity_vec.append(desired_velocity)
+            # for the orientation part, make sure the rotation vectors are at the same direction as the previous step
+            # the graph will show the rotation vector between the world frame and XX frame writen in the world frame
+            if self.time == 0:
+                self.impedance_orientation = R.from_matrix(desired_orientation).as_rotvec()
+            elif np.dot(R.from_matrix(desired_orientation).as_rotvec(), self.impedance_orientation) > 0:
+                self.impedance_orientation = R.from_matrix(desired_orientation).as_rotvec()
+            elif np.dot(R.from_matrix(desired_orientation).as_rotvec(), self.impedance_orientation) < 0:
+                self.impedance_orientation = -1 * R.from_matrix(desired_orientation).as_rotvec()
+            self.impedance_orientation_vec.append(self.impedance_orientation)
+            self.impedance_angle_velocity_vec.append(desired_angle_velocity)
+
+            self.PD_force_command.append(wrench)
+            self.add_path_parameter()
+
+            if self.time >= self.simulation_total_time - 2*self.Delta_T and self.plotting:
+                self.plotter()
+
+        # Only linear interpolator is currently supported
+        if self.interpolator is not None:
+            # Linear case
+            if self.interpolator.order == 1:
+                self.current_torque = self.interpolator.get_interpolated_goal()
+            else:
+                # Nonlinear case not currently supported
+                pass
+        else:
+            self.current_torque = np.array(self.goal_torque)
+
+        return

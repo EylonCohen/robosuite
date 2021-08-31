@@ -5,7 +5,7 @@ pybullet==2.6.9
 gym
 
 # Mac OS X only
-hidapi
+#hidapi
 
 # required for demonstration utils
 h5py

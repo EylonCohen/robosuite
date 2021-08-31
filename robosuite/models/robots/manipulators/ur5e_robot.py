@@ -29,6 +29,7 @@ class UR5e(ManipulatorModel):
     @property
     def init_qpos(self):
         return np.array([-0.470, -1.735, 2.480, -2.275, -1.590, -1.991])
+        # return np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
 
     @property
     def base_xpos_offset(self):

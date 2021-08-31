@@ -7,7 +7,7 @@ NOTE: convention for quaternions is (x, y, z, w)
 import math
 import numpy as np
 from robosuite.utils.numba import jit_decorator
-
+from scipy.spatial.transform import Rotation as R
 
 PI = np.pi
 EPS = np.finfo(float).eps * 4.
@@ -935,3 +935,13 @@ def matrix_inverse(matrix):
         np.array: 2d-array representing the matrix inverse
     """
     return np.linalg.inv(matrix)
+
+# EC - this is the connection between phi_dot and the angular velocity w
+def T_mat(V):
+    # t = np.array([[1, 0, -np.sin(V[1])],
+    #              [0, np.cos(V[0]), np.cos(V[1])],
+    #              [0, -np.sin(V[0]), np.cos(V[1])]])
+    T = np.array([[1, 0, np.sin(V[1])],
+                  [0, np.cos(V[0]), -np.cos(V[1])*np.sin(V[0])],
+                  [0, np.sin(V[0]), np.cos(V[1])*np.cos(V[0])]])
+    return T
