@@ -95,17 +95,17 @@ class MujocoEnv(metaclass=EnvMeta):
     """
 
     def __init__(
-        self,
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        render_camera="frontview",
-        render_collision_mesh=False,
-        render_visual_mesh=True,
-        render_gpu_device_id=-1,
-        control_freq=20,
-        horizon=None,
-        ignore_done=False,
-        hard_reset=True
+            self,
+            has_renderer=False,
+            has_offscreen_renderer=True,
+            render_camera="frontview",
+            render_collision_mesh=False,
+            render_visual_mesh=True,
+            render_gpu_device_id=-1,
+            control_freq=20,
+            horizon=None,
+            ignore_done=False,
+            hard_reset=True
     ):
         # First, verify that both the on- and off-screen renderers are not being used simultaneously
         if has_renderer is True and has_offscreen_renderer is True:
@@ -121,18 +121,18 @@ class MujocoEnv(metaclass=EnvMeta):
         self.viewer = None
 
         # Simulation-specific attributes
-        self._observables = {}                      # Maps observable names to observable objects
-        self._obs_cache = {}                        # Maps observable names to pre-/partially-computed observable values
+        self._observables = {}  # Maps observable names to observable objects
+        self._obs_cache = {}  # Maps observable names to pre-/partially-computed observable values
         self.control_freq = control_freq
         self.horizon = horizon
         self.ignore_done = ignore_done
         self.hard_reset = hard_reset
-        self._model_postprocessor = None            # Function to post-process model after load_model() call
+        self._model_postprocessor = None  # Function to post-process model after load_model() call
         self.model = None
         self.cur_time = None
         self.model_timestep = None
         self.control_timestep = None
-        self.deterministic_reset = False            # Whether to add randomized resetting of objects / robot joints
+        self.deterministic_reset = False  # Whether to add randomized resetting of objects / robot joints
 
         # Load the model
         self._load_model()
@@ -148,7 +148,6 @@ class MujocoEnv(metaclass=EnvMeta):
 
         # Load observables
         self._observables = self._setup_observables()
-
 
     def initialize_time(self, control_freq):
         """
@@ -253,7 +252,11 @@ class MujocoEnv(metaclass=EnvMeta):
         # Make sure that all sites are toggled OFF by default
         self.visualize(vis_settings={vis: False for vis in self._visualizations})
         # Return new observations
-        return self._get_observations(force_update=True)
+        obs = OrderedDict()
+        obs['Not_really_obs'] = 1
+
+        # return self._get_observations(force_update=True)
+        return obs
 
     def _reset_internal(self):
         """Resets simulation internal configurations."""
@@ -366,35 +369,78 @@ class MujocoEnv(metaclass=EnvMeta):
             ValueError: [Steps past episode termination]
 
         """
-        if self.done:
-            raise ValueError("executing action in terminated episode")
+        # EC - this if statement decide whether to do RL or to display the simulation
+        if self.has_renderer:
+            # EC - display simulation - up to ######
 
-        self.timestep += 1
-        # EC - temp_time = self.sim.data.time
+            if self.done:
+                raise ValueError("executing action in terminated episode")
 
-        # Since the env.step frequency is slower than the mjsim timestep frequency, the internal controller will output
-        # multiple torque commands in between new high level action commands. Therefore, we need to denote via
-        # 'policy_step' whether the current step we're taking is simply an internal update of the controller,
-        # or an actual policy update
-        policy_step = True
+            self.timestep += 1
 
-        # Loop through the simulation at the model timestep rate until we're ready to take the next policy step
-        # (as defined by the control frequency specified at the environment level)
-        for i in range(int(self.control_timestep / self.model_timestep)):
-            self.sim.forward()
-            self._pre_action(action, policy_step)
-            self.sim.step()
-            self._update_observables()
-            policy_step = False
+            # Since the env.step frequency is slower than the mjsim timestep frequency, the internal controller will output
+            # multiple torque commands in between new high level action commands. Therefore, we need to denote via
+            # 'policy_step' whether the current step we're taking is simply an internal update of the controller,
+            # or an actual policy update
+            policy_step = True
 
-        # Note: this is done all at once to avoid floating point inaccuracies
-        self.cur_time += self.control_timestep
+            # Loop through the simulation at the model timestep rate until we're ready to take the next policy step
+            # (as defined by the control frequency specified at the environment level)
+            for i in range(int(self.control_timestep / self.model_timestep)):
+                self.sim.forward()
+                self._pre_action(action, policy_step)
+                self.sim.step()
+                self._update_observables()
+                policy_step = False
 
-        reward, done, info = self._post_action(action)
-        return self._get_observations(), reward, done, info
+            # Note: this is done all at once to avoid floating point inaccuracies
+            self.cur_time += self.control_timestep
 
-    # EC -  get all path information
-    def get_path_info(self):
+            done, info = self._post_action(action)
+            reward = self.reward(action)
+            ########################################################
+            # EC - this is the original code I changed post_action() so it could not be used any more
+            # reward, done, info = self._post_action(action)
+        else:
+            # EC - do RL up to ##########
+            done = False
+
+            # Since the env.step frequency is slower than the mjsim timestep frequency, the internal controller will output
+            # multiple torque commands in between new high level action commands. Therefore, we need to denote via
+            # 'policy_step' whether the current step we're taking is simply an internal update of the controller,
+            # or an actual policy update
+            #  EC - in the learning notation the 'policy step' is actually relevant only fo the first step!!
+            policy_step = True
+            while not done:
+                if self.done:
+                    raise ValueError("executing action in terminated episode")
+
+                self.timestep += 1
+                # Loop through the simulation at the model timestep rate until we're ready to take the next policy step
+                # (as defined by the control frequency specified at the environment level)
+                for i in range(int(self.control_timestep / self.model_timestep)):
+                    self.sim.forward()
+                    self._pre_action(action, policy_step)
+                    self.sim.step()
+                    self._update_observables()
+                    policy_step = False
+
+                # Note: this is done all at once to avoid floating point inaccuracies
+                self.cur_time += self.control_timestep
+
+                done, info = self._post_action(action)
+            # EC - compute reward only once at the end of the episode
+            reward = self.reward(action)
+            ########################################
+
+        # EC - make obs not relevant
+        # return self._get_observations(), reward, done, info
+        obs = OrderedDict()
+        obs['Not_really_obs'] = 1
+        return obs, reward, done, info
+
+    # EC
+    def is_robot_stable(self):
         """
 
         Returns:
@@ -426,12 +472,13 @@ class MujocoEnv(metaclass=EnvMeta):
                 - (dict) empty dict to be filled with information by subclassed method
 
         """
-        reward = self.reward(action)
+        # reward = self.reward(action)
 
         # done if number of elapsed timesteps is greater than horizon
-        self.done = (self.timestep >= self.horizon) and not self.ignore_done
+        self.done = (self.timestep >= self.horizon or self.is_robot_stable() == False) and not self.ignore_done
 
-        return reward, self.done, {}
+        # return reward, self.done, {}
+        return self.done, {}
 
     def reward(self, action):
         """
@@ -584,7 +631,7 @@ class MujocoEnv(metaclass=EnvMeta):
         Args:
             observable (Observable): Observable instance.
         """
-        assert observable.name not in self._observables,\
+        assert observable.name not in self._observables, \
             "Observable name {} is already associated with an existing observable! Use modify_observable(...) " \
             "to modify a pre-existing observable.".format(observable.name)
         self._observables[observable.name] = observable
@@ -602,7 +649,7 @@ class MujocoEnv(metaclass=EnvMeta):
                 match the function being replaced.
         """
         # Find the observable
-        assert observable_name in self._observables, "No valid observable with name {} found. Options are: {}".\
+        assert observable_name in self._observables, "No valid observable with name {} found. Options are: {}". \
             format(observable_name, self.observation_names)
         obs = self._observables[observable_name]
         # replace attribute accordingly

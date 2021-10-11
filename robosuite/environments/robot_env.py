@@ -433,16 +433,16 @@ class RobotEnv(MujocoEnv):
             # Lastly, replace camera names with the updated ones
             self.camera_names = temp_names
 
-    # EC -  get all path information
-    def get_path_info(self):
+    # EC
+    def is_robot_stable(self):
         """
 
         Returns:
 
         """
         for idx, robot in enumerate(self.robots):
-            info = robot.get_path_info()
-        return info
+            is_robot_stable = robot.is_robot_stable()
+        return is_robot_stable
 
     def _pre_action(self, action, policy_step=False):
         """

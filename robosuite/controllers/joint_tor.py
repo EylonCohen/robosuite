@@ -70,6 +70,7 @@ class JointTorqueController(Controller):
                  input_min=-1,
                  output_max=0.05,
                  output_min=-0.05,
+                 control_dim=108,
                  policy_freq=None,
                  torque_limits=None,
                  interpolator=None,
@@ -91,8 +92,8 @@ class JointTorqueController(Controller):
         )
 
         # Control dimension
-        self.control_dim = len(joint_indexes["joints"])
-
+        # self.control_dim = len(joint_indexes["joints"])
+        self.control_dim = control_dim
         # input and output max and min (allow for either explicit lists or single numbers)
         self.input_max = self.nums2array(input_max, self.control_dim)
         self.input_min = self.nums2array(input_min, self.control_dim)
@@ -114,8 +115,7 @@ class JointTorqueController(Controller):
         self.current_torque = np.zeros(self.control_dim)  # Current torques being outputted, pre-compensation
         self.torques = None  # Torques returned every time run_controller is called
 
-
-    def set_goal(self, torques):
+    def set_goal(self, action):
         """
         Sets goal based on input @torques.
 
@@ -126,7 +126,12 @@ class JointTorqueController(Controller):
             AssertionError: [Invalid action dimension size]
         """
         # Update state
-        # self.update()
+        self.update()
+        # EC - this is not a good if statement! need to be changed!
+        if not self.plotting:
+            self.K_imp = self.check_matrix_positivity(100 * (action[:36]).reshape(6, 6))
+            self.C_imp = self.check_matrix_positivity(100 * (action[36:72]).reshape(6, 6))
+            self.M_imp = self.check_matrix_positivity(1 * (action[72:108]).reshape(6, 6))
 
         self.goal_torque = np.zeros(self.control_dim)  # just for sending something. it doesn't matter
 
@@ -144,7 +149,7 @@ class JointTorqueController(Controller):
         # Update state
         self.update()
         # EC - calculate minimum jerk path
-        if self.time <= self.tfinal:
+        if self.time <= self.simulation_total_time:
             self._min_jerk()
 
         # check the if the any axis force is greater then some value
@@ -244,10 +249,10 @@ class JointTorqueController(Controller):
                                                                                  self.J_pos,
                                                                                  self.J_ori)
         decoupled_wrench = np.dot(lambda_full, wrench)
-        torques = np.dot(self.J_full.T, decoupled_wrench) #- (np.dot(self.J_full.T, self.sim.data.sensordata)) * self.is_contact
+        torques = np.dot(self.J_full.T,
+                         decoupled_wrench)  # - (np.dot(self.J_full.T, self.sim.data.sensordata)) * self.is_contact
 
         # torques = np.dot(self.J_full.T, wrench)# - (np.dot(self.J_full.T, self.interaction_forces)) * self.is_contact
-        assert len(torques) == self.control_dim, "Delta torque must be equal to the robot's joint dimension space!"
 
         # make the robot work under torque limitations
         self.goal_torque = np.clip(torques, self.torque_limits[0], self.torque_limits[1])
@@ -281,7 +286,8 @@ class JointTorqueController(Controller):
             self.PD_force_command.append(wrench)
             self.add_path_parameter()
 
-            if self.time >= self.simulation_total_time - 2*self.Delta_T and self.plotting:
+            if self.time >= self.simulation_total_time - 2 * self.Delta_T and self.plotting:
+                # print(np.array(self.sim.data.qpos[self.qpos_index]))
                 self.plotter()
 
         # Only linear interpolator is currently supported
@@ -296,3 +302,11 @@ class JointTorqueController(Controller):
             self.current_torque = np.array(self.goal_torque)
 
         return
+
+    def check_matrix_positivity(self, mat):
+        lambda_min = np.min(np.linalg.eigvals(mat))
+        if lambda_min < 0:
+            mu = -2*lambda_min
+            mat = mat + mu * np.identity(mat.shape[0])
+            print(np.min(np.linalg.eigvals(mat)))
+        return mat

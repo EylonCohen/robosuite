@@ -112,25 +112,53 @@ class Controller(object, metaclass=abc.ABCMeta):
         self.initial_ee_pos = self.ee_pos
         self.initial_ee_ori_mat = self.ee_ori_mat
 
-        # minimum jerk specification - EC
-        self.initial_position = self.initial_ee_pos
-        self.final_position = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
-        self.final_position = [self.initial_position[0], self.initial_position[1]-0.2, self.initial_position[2]]
-        self.initial_orientation = self.initial_ee_ori_mat
-        # self.final_orientation = np.array([[1, 0, 0],
-        #                                    [0, 0, 1],
-        #                                    [0, -1, 0]]) # peg horizantal
-        self.final_orientation = np.array([[1, 0, 0],
-                                           [0, -1, 0],
-                                           [0, 0, -1]])  # peg vertical (pointing down)
-
-        self.euler_initial_orientation = R.from_matrix(self.initial_orientation).as_euler('xyz', degrees=False)
-        self.euler_final_orientation = R.from_matrix(self.final_orientation).as_euler('xyz', degrees=False)
-        indexes_for_correction = np.abs(self.euler_final_orientation - self.euler_initial_orientation) > np.pi
-        correction = np.sign(self.euler_final_orientation) * (2 * np.pi) * indexes_for_correction
-        self.euler_final_orientation = self.euler_final_orientation - correction
-
         self.simulation_total_time = simulation_total_time  # from main
+        # EC - define the duration of each trajectory part by the
+        self.trajectory_duration_ratio = 0.5
+
+        # self.hole_middle_cylinder = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
+        # EC - when the box origin is at (0,0) the nominal_hole_middle_cylinder is at [0.2, 0.062, 0.8]
+        self.nominal_hole_middle_cylinder = np.array([0.2, 0.062, 0.8])
+        self.peg_edge = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("peg_site")])
+        self.delta_z = 0.005  # make sure not hitting tha table
+        self.z_diff = self.nominal_hole_middle_cylinder[2] - self.peg_edge[2] + self.delta_z
+
+        # EC - minimum jerk specification first trajectory_part
+        self.first_trajectory_part_initial_position = self.initial_ee_pos
+        self.first_trajectory_part_final_position = [self.nominal_hole_middle_cylinder[0],
+                                                     self.nominal_hole_middle_cylinder[1],
+                                                     self.first_trajectory_part_initial_position[2]
+                                                     + self.z_diff + 7 * self.delta_z]
+        self.first_trajectory_part_initial_orientation = self.initial_ee_ori_mat
+        self.first_trajectory_part_final_orientation = np.array([[1, 0, 0],
+                                                                 [0, -1, 0],
+                                                                 [0, 0, -1]])  # peg vertical (pointing down)
+
+        self.first_trajectory_part_euler_initial_orientation = R.from_matrix(
+            self.first_trajectory_part_initial_orientation).as_euler('xyz', degrees=False)
+        self.first_trajectory_part_euler_final_orientation = R.from_matrix(
+            self.first_trajectory_part_final_orientation).as_euler('xyz', degrees=False)
+        indexes_for_correction = np.abs(
+            self.first_trajectory_part_euler_final_orientation - self.first_trajectory_part_euler_initial_orientation) > np.pi
+        correction = np.sign(self.first_trajectory_part_euler_final_orientation) * (2 * np.pi) * indexes_for_correction
+        self.first_trajectory_part_euler_final_orientation = self.first_trajectory_part_euler_final_orientation - correction
+        self.first_trajectory_part_final_time = self.simulation_total_time * self.trajectory_duration_ratio
+
+        # EC - minimum jerk specification second trajectory_part
+        self.initiate_trajectory = True
+        self.second_trajectory_part_initial_position = None
+        self.second_trajectory_part_final_position = None
+        self.second_trajectory_part_initial_orientation = None
+        self.second_trajectory_part_final_orientation = np.array([[1, 0, 0],
+                                                                  [0, -1, 0],
+                                                                  [0, 0, -1]])  # peg vertical (pointing down)
+        self.second_trajectory_part_euler_initial_orientation = None
+        self.second_trajectory_part_euler_final_orientation = None
+        self.second_trajectory_part_euler_final_orientation = None
+        self.second_trajectory_part_final_time = self.simulation_total_time
+
+        # define a reference distance for deciding if the robot is not stable
+        self.nominal_stability_distance = None
 
         # EC - Run further definition and class variables
         self._specify_constants()
@@ -143,6 +171,7 @@ class Controller(object, metaclass=abc.ABCMeta):
         self.Delta_T = 0.002
         self.f_0 = np.array([0, 0, 0, 0, 0, 0])
 
+        # EC - this is the default values
         self.K = 5000
         self.M = 5
         Wn = np.sqrt(self.K / self.M)
@@ -221,50 +250,86 @@ class Controller(object, metaclass=abc.ABCMeta):
         Compute the value of position velocity and acceleration in a minimum jerk trajectory
 
         """
-        t = self.time
-        x_traj = (self.X_final - self.X_init) / (self.tfinal ** 3) * (
-                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + self.X_init
-        y_traj = (self.Y_final - self.Y_init) / (self.tfinal ** 3) * (
-                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + self.Y_init
-        z_traj = (self.Z_final - self.Z_init) / (self.tfinal ** 3) * (
-                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + self.Z_init
+        if self.time < self.first_trajectory_part_final_time:  # first trajectory part
+            X_init, Y_init, Z_init = self.first_trajectory_part_initial_position
+            X_final, Y_final, Z_final = self.first_trajectory_part_final_position
+            euler_initial_orientation = self.first_trajectory_part_euler_initial_orientation
+            euler_final_orientation = self.first_trajectory_part_euler_final_orientation
+            tfinal = self.first_trajectory_part_final_time
+            t = self.time
+        else:  # second trajectory part
+            if self.initiate_trajectory:
+                self.initiate_trajectory = False
+                self.nominal_stability_distance = np.linalg.norm(self.peg_edge -
+                                        np.array(self.sim.data.site_xpos[
+                                                     self.sim.model.site_name2id("hole_middle_cylinder")]))
+                self.z_diff = self.nominal_hole_middle_cylinder[2] - self.peg_edge[2] + self.delta_z
+                self.second_trajectory_part_initial_position = self.ee_pos
+                self.second_trajectory_part_final_position = [self.nominal_hole_middle_cylinder[0],
+                                                              self.nominal_hole_middle_cylinder[1],
+                                                              self.second_trajectory_part_initial_position[
+                                                                  2] + self.z_diff]
+                self.second_trajectory_part_initial_orientation = self.ee_ori_mat
+                self.second_trajectory_part_euler_initial_orientation = R.from_matrix(
+                    self.second_trajectory_part_initial_orientation).as_euler('xyz', degrees=False)
+                self.second_trajectory_part_euler_final_orientation = R.from_matrix(
+                    self.second_trajectory_part_final_orientation).as_euler('xyz', degrees=False)
+                indexes_for_correction = np.abs(
+                    self.second_trajectory_part_euler_final_orientation - self.second_trajectory_part_euler_initial_orientation) > np.pi
+                correction = np.sign(self.second_trajectory_part_euler_final_orientation) * (
+                            2 * np.pi) * indexes_for_correction
+                self.second_trajectory_part_euler_final_orientation = self.second_trajectory_part_euler_final_orientation - correction
+
+            X_init, Y_init, Z_init = self.second_trajectory_part_initial_position
+            X_final, Y_final, Z_final = self.second_trajectory_part_final_position
+            euler_initial_orientation = self.second_trajectory_part_euler_initial_orientation
+            euler_final_orientation = self.second_trajectory_part_euler_final_orientation
+            tfinal = self.simulation_total_time - self.first_trajectory_part_final_time
+            t = self.time - self.first_trajectory_part_final_time
+
+        x_traj = (X_final - X_init) / (tfinal ** 3) * (
+                6 * (t ** 5) / (tfinal ** 2) - 15 * (t ** 4) / tfinal + 10 * (t ** 3)) + X_init
+        y_traj = (Y_final - Y_init) / (tfinal ** 3) * (
+                6 * (t ** 5) / (tfinal ** 2) - 15 * (t ** 4) / tfinal + 10 * (t ** 3)) + Y_init
+        z_traj = (Z_final - Z_init) / (tfinal ** 3) * (
+                6 * (t ** 5) / (tfinal ** 2) - 15 * (t ** 4) / tfinal + 10 * (t ** 3)) + Z_init
         self.min_jerk_position = np.array([x_traj, y_traj, z_traj])
 
         # velocities
-        vx = (self.X_final - self.X_init) / (self.tfinal ** 3) * (
-                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
-        vy = (self.Y_final - self.Y_init) / (self.tfinal ** 3) * (
-                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
-        vz = (self.Z_final - self.Z_init) / (self.tfinal ** 3) * (
-                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+        vx = (X_final - X_init) / (tfinal ** 3) * (
+                30 * (t ** 4) / (tfinal ** 2) - 60 * (t ** 3) / tfinal + 30 * (t ** 2))
+        vy = (Y_final - Y_init) / (tfinal ** 3) * (
+                30 * (t ** 4) / (tfinal ** 2) - 60 * (t ** 3) / tfinal + 30 * (t ** 2))
+        vz = (Z_final - Z_init) / (tfinal ** 3) * (
+                30 * (t ** 4) / (tfinal ** 2) - 60 * (t ** 3) / tfinal + 30 * (t ** 2))
         self.min_jerk_velocity = np.array([vx, vy, vz])
 
         # acceleration
-        ax = (self.X_final - self.X_init) / (self.tfinal ** 3) * (
-                120 * (t ** 3) / (self.tfinal ** 2) - 180 * (t ** 2) / self.tfinal + 60 * t)
-        ay = (self.Y_final - self.Y_init) / (self.tfinal ** 3) * (
-                120 * (t ** 3) / (self.tfinal ** 2) - 180 * (t ** 2) / self.tfinal + 60 * t)
-        az = (self.Z_final - self.Z_init) / (self.tfinal ** 3) * (
-                120 * (t ** 3) / (self.tfinal ** 2) - 180 * (t ** 2) / self.tfinal + 60 * t)
+        ax = (X_final - X_init) / (tfinal ** 3) * (
+                120 * (t ** 3) / (tfinal ** 2) - 180 * (t ** 2) / tfinal + 60 * t)
+        ay = (Y_final - Y_init) / (tfinal ** 3) * (
+                120 * (t ** 3) / (tfinal ** 2) - 180 * (t ** 2) / tfinal + 60 * t)
+        az = (Z_final - Z_init) / (tfinal ** 3) * (
+                120 * (t ** 3) / (tfinal ** 2) - 180 * (t ** 2) / tfinal + 60 * t)
         self.min_jerk_acceleration = np.array([ax, ay, az])
 
         # euler xyz representation
-        alfa = (self.euler_final_orientation[0] - self.euler_initial_orientation[0]) / (self.tfinal ** 3) * (
-                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + \
-               self.euler_initial_orientation[0]
-        beta = (self.euler_final_orientation[1] - self.euler_initial_orientation[1]) / (self.tfinal ** 3) * (
-                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + \
-               self.euler_initial_orientation[1]
-        gamma = (self.euler_final_orientation[2] - self.euler_initial_orientation[2]) / (self.tfinal ** 3) * (
-                6 * (t ** 5) / (self.tfinal ** 2) - 15 * (t ** 4) / self.tfinal + 10 * (t ** 3)) + \
-                self.euler_initial_orientation[2]
+        alfa = (euler_final_orientation[0] - euler_initial_orientation[0]) / (tfinal ** 3) * (
+                6 * (t ** 5) / (tfinal ** 2) - 15 * (t ** 4) / tfinal + 10 * (t ** 3)) + \
+               euler_initial_orientation[0]
+        beta = (euler_final_orientation[1] - euler_initial_orientation[1]) / (tfinal ** 3) * (
+                6 * (t ** 5) / (tfinal ** 2) - 15 * (t ** 4) / tfinal + 10 * (t ** 3)) + \
+               euler_initial_orientation[1]
+        gamma = (euler_final_orientation[2] - euler_initial_orientation[2]) / (tfinal ** 3) * (
+                6 * (t ** 5) / (tfinal ** 2) - 15 * (t ** 4) / tfinal + 10 * (t ** 3)) + \
+                euler_initial_orientation[2]
 
-        alfa_dot = (self.euler_final_orientation[0] - self.euler_initial_orientation[0]) / (self.tfinal ** 3) * (
-                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
-        beta_dot = (self.euler_final_orientation[1] - self.euler_initial_orientation[1]) / (self.tfinal ** 3) * (
-                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
-        gamma_dot = (self.euler_final_orientation[2] - self.euler_initial_orientation[2]) / (self.tfinal ** 3) * (
-                30 * (t ** 4) / (self.tfinal ** 2) - 60 * (t ** 3) / self.tfinal + 30 * (t ** 2))
+        alfa_dot = (euler_final_orientation[0] - euler_initial_orientation[0]) / (tfinal ** 3) * (
+                30 * (t ** 4) / (tfinal ** 2) - 60 * (t ** 3) / tfinal + 30 * (t ** 2))
+        beta_dot = (euler_final_orientation[1] - euler_initial_orientation[1]) / (tfinal ** 3) * (
+                30 * (t ** 4) / (tfinal ** 2) - 60 * (t ** 3) / tfinal + 30 * (t ** 2))
+        gamma_dot = (euler_final_orientation[2] - euler_initial_orientation[2]) / (tfinal ** 3) * (
+                30 * (t ** 4) / (tfinal ** 2) - 60 * (t ** 3) / tfinal + 30 * (t ** 2))
 
         self.min_jerk_orientation = np.array([alfa, beta, gamma])
         self.min_jerk_orientation_dot = np.array([alfa_dot, beta_dot, gamma_dot])
@@ -281,13 +346,6 @@ class Controller(object, metaclass=abc.ABCMeta):
         Assign constants in class variables
 
         """
-        self.X_init = self.initial_position[0]
-        self.Y_init = self.initial_position[1]
-        self.Z_init = self.initial_position[2]
-
-        self.X_final = self.final_position[0]
-        self.Y_final = self.final_position[1]
-        self.Z_final = self.final_position[2]
 
         self.min_jerk_position = None
         self.min_jerk_velocity = None
@@ -751,33 +809,11 @@ class Controller(object, metaclass=abc.ABCMeta):
         return dydt
 
     # EC
-    def get_path_info(self):
-        """
-
-        Returns:
-
-        """
-        info = {
-            "time": self.time_vec,
-            "min_jerk_position_vec": self.min_jerk_position_vec,
-            "min_jerk_velocity_vec": self.min_jerk_velocity_vec,
-            "min_jerk_acceleration_vec": self.min_jerk_acceleration_vec,
-            "min_jerk_orientation_vec": self.min_jerk_orientation_vec,
-            "min_jerk_angle_velocity_vec": self.min_jerk_angle_velocity_vec,
-            "impedance_position_vec": self.impedance_position_vec,
-            "impedance_velocity_vec": self.impedance_velocity_vec,
-            "impedance_orientation_vec": self.impedance_orientation_vec,
-            "impedance_angle_velocity_vec": self.impedance_angle_velocity_vec,
-            "real_position_vec": self.real_position_vec,
-            "real_velocity_vec": self.real_velocity_vec,
-            "real_orientation_vec": self.real_orientation_vec,
-            "real_angle_velocity_vec": self.real_angle_velocity_vec,
-            "interaction_forces_vec": self.interaction_forces_vec,
-            "K_imp": self.K,
-            "M_imp": self.M,
-            "C_imp": self.C,
-            "contact_time": self.contact_time,
-            "min_jerk_orientation_dot": self.min_jerk_orientation_dot_vec,
-        }
-
-        return info
+    def is_robot_stable(self):
+        is_robot_stable = True
+        if self.is_contact:
+            current_distance = np.linalg.norm(self.peg_edge - np.array(self.sim.data.site_xpos[
+                                                     self.sim.model.site_name2id("hole_middle_cylinder")]))
+            if self.nominal_stability_distance < current_distance:
+                is_robot_stable = False
+        return is_robot_stable

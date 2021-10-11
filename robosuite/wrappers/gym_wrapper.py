@@ -54,9 +54,12 @@ class GymWrapper(Wrapper, Env):
 
         # set up observation and action spaces
         obs = self.env.reset()
-        self.modality_dims = {key: obs[key].shape for key in self.keys}
-        flat_ob = self._flatten_obs(obs)
-        self.obs_dim = flat_ob.size
+        # EC
+        # self.modality_dims = {key: obs[key].shape for key in self.keys}
+        # flat_ob = self._flatten_obs(obs)
+        # EC
+        flat_ob = [np.array(obs['Not_really_obs']).flatten()]
+        self.obs_dim = len(flat_ob)
         high = np.inf * np.ones(self.obs_dim)
         low = -high
         self.observation_space = spaces.Box(low=low, high=high)
@@ -90,7 +93,10 @@ class GymWrapper(Wrapper, Env):
             np.array: Flattened environment observation space after reset occurs
         """
         ob_dict = self.env.reset()
-        return self._flatten_obs(ob_dict)
+        # EC
+        flat_ob = [np.array(ob_dict['Not_really_obs']).flatten()]
+        # return self._flatten_obs(ob_dict)
+        return flat_ob
 
     def step(self, action):
         """
@@ -108,7 +114,9 @@ class GymWrapper(Wrapper, Env):
                 - (dict) misc information
         """
         ob_dict, reward, done, info = self.env.step(action)
-        return self._flatten_obs(ob_dict), reward, done, info
+        # EC
+        # return self._flatten_obs(ob_dict), reward, done, info
+        return ob_dict, reward, done, info
 
     def seed(self, seed=None):
         """

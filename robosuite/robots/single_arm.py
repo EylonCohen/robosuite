@@ -241,7 +241,8 @@ class SingleArm(Manipulator):
 
         gripper_action = None
         if self.has_gripper:
-            gripper_action = action[self.controller.control_dim:]  # all indexes past controller dimension indexes
+            # gripper_action = action[self.controller.control_dim:]  # all indexes past controller dimension indexes
+            gripper_action = np.array([1])  # make sure the gripper is closed
             arm_action = action[:self.controller.control_dim]
         else:
             arm_action = action
@@ -264,32 +265,29 @@ class SingleArm(Manipulator):
         # Apply joint torque control
         self.sim.data.ctrl[self._ref_joint_actuator_indexes] = self.torques
 
+        ## EC - I put this under comment to make the simulation faster (up to ####)
         # If this is a policy step, also update buffers holding recent values of interest
-        if policy_step:
-            # Update proprioceptive values
-            self.recent_qpos.push(self._joint_positions)
-            self.recent_actions.push(action)
-            self.recent_torques.push(self.torques)
-            self.recent_ee_forcetorques.push(np.concatenate((self.ee_force, self.ee_torque)))
-            self.recent_ee_pose.push(np.concatenate((self.controller.ee_pos, T.mat2quat(self.controller.ee_ori_mat))))
-            self.recent_ee_vel.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
+        # if policy_step:
+        #     # Update proprioceptive values
+        #     self.recent_qpos.push(self._joint_positions)
+        #     self.recent_actions.push(action)
+        #     self.recent_torques.push(self.torques)
+        #     self.recent_ee_forcetorques.push(np.concatenate((self.ee_force, self.ee_torque)))
+        #     self.recent_ee_pose.push(np.concatenate((self.controller.ee_pos, T.mat2quat(self.controller.ee_ori_mat))))
+        #     self.recent_ee_vel.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
+        #
+        #     # Estimation of eef acceleration (averaged derivative of recent velocities)
+        #     self.recent_ee_vel_buffer.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
+        #     diffs = np.vstack([self.recent_ee_acc.current,
+        #                        self.control_freq * np.diff(self.recent_ee_vel_buffer.buf, axis=0)])
+        #     ee_acc = np.array([np.convolve(col, np.ones(10) / 10., mode='valid')[0] for col in diffs.transpose()])
+        #     self.recent_ee_acc.push(ee_acc)
+        #######################################################
 
-            # Estimation of eef acceleration (averaged derivative of recent velocities)
-            self.recent_ee_vel_buffer.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
-            diffs = np.vstack([self.recent_ee_acc.current,
-                               self.control_freq * np.diff(self.recent_ee_vel_buffer.buf, axis=0)])
-            ee_acc = np.array([np.convolve(col, np.ones(10) / 10., mode='valid')[0] for col in diffs.transpose()])
-            self.recent_ee_acc.push(ee_acc)
-
-    # EC -  get all path information
-    def get_path_info(self):
-        """
-
-        Returns:
-
-        """
-        info = self.controller.get_path_info()
-        return info
+    # EC
+    def is_robot_stable(self):
+        is_robot_stable = self.controller.is_robot_stable()
+        return is_robot_stable
 
     def _visualize_grippers(self, visible):
         """

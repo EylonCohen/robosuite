@@ -192,7 +192,6 @@ class PegInHole(SingleArmEnv):
         # EC - define desired initial joint position
         self.user_init_qpos = user_init_qpos
 
-
         super().__init__(
             robots=robots,
             env_configuration=env_configuration,
@@ -219,8 +218,6 @@ class PegInHole(SingleArmEnv):
 
         )
 
-
-
     def reward(self, action=None):
         """
         Reward function for the task.
@@ -246,7 +243,22 @@ class PegInHole(SingleArmEnv):
         Returns:
             float: reward value
         """
-        reward = 0.
+        # check euclidean distance between peg edge and the goal
+        peg_edge = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("peg_site")])
+        hole_middle_cylinder = np.array(
+            self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
+        dist = np.linalg.norm(peg_edge - hole_middle_cylinder)
+        eps = 0.0001  # avoiding inf rewards
+        dist_reward = 1 / (dist + 0.0001)
+        # check "how much" does the z axis of the hole and the peg are at the same direction
+        peg_ori_mat = np.array(
+            self.sim.data.site_xmat[self.sim.model.site_name2id('gripper0_grip_site')].reshape([3, 3]))
+        peg_z_axis = np.array([0, 0, 1])
+        peg_z_axis_in_world = peg_ori_mat @ peg_z_axis
+        z_axis_in_world = np.array([0, 0, 1])
+        projection = np.dot(peg_z_axis_in_world, z_axis_in_world)
+        projection_reward = 1 / (10 * (projection + 1))
+        reward = dist_reward  # + projection_reward
         #
         # # sparse completion reward
         # if self._check_success():
@@ -279,7 +291,7 @@ class PegInHole(SingleArmEnv):
         super()._load_model()
 
         # Adjust base pose accordingly
-        
+
         xpos = self.robots[0].robot_model.base_xpos_offset["table"](self.table_full_size[0])
         self.robots[0].robot_model.set_base_xpos(xpos)
 
@@ -329,7 +341,7 @@ class PegInHole(SingleArmEnv):
         # hole_pos_set = np.array(
         #     [np.random.uniform(high=x_range[0], low=x_range[1]), np.random.uniform(high=y_range[0], low=y_range[1]),
         #      self.table_height])
-        hole_pos_set = np.array([0, -0.2, self.table_height])
+        hole_pos_set = np.array([0.015, 0.015, self.table_height])
         hole_pos_str = ' '.join(map(str, hole_pos_set))
         hole_rot_str = ' '.join(map(str, hole_rot_set))
 
