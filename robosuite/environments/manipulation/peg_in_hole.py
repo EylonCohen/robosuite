@@ -2,7 +2,7 @@ import collections
 from collections import OrderedDict
 import numpy as np
 import robosuite.utils.transform_utils as T
-
+from scipy.spatial.transform import Rotation as R
 from robosuite.utils.transform_utils import convert_quat
 from robosuite.utils.mjcf_utils import CustomMaterial, array_to_string, new_site, find_elements
 
@@ -161,9 +161,11 @@ class PegInHole(SingleArmEnv):
             r_reach_value=0.94,
             error_type='circle',
             control_spec=36,
-            peg_radius=0.015,  # (0.00125, 0.00125)
-            peg_length=0.08,  # it is actually half of the peg length
+            peg_radius=0.004,  # (0.00125, 0.00125)
+            peg_length=0.12,  # it is actually half of the peg length
             Peg_density=1,
+            radial_error=0.0,
+            angular_error=0.0,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -171,10 +173,19 @@ class PegInHole(SingleArmEnv):
         self.table_height = table_height
         self.table_offset = np.array((0, 0, self.table_height))
 
+        # only for putting the box in a better pos
+        self.box_shift = np.array((0.2, 0, 0))
+        controller_configs['box_shift'] = self.box_shift
+        # in euler notation "xyz"
+        self.box_ori = np.array([np.deg2rad(0), 0.0, 0])
+        # self.box_ori = np.array([0, 0.0, 0])
+        controller_configs['box_ori'] = self.box_ori
         # Save peg specs
         self.peg_radius = peg_radius
         self.peg_length = peg_length
         self.Peg_density = Peg_density
+        self.radial_error = radial_error
+        self.angular_error = angular_error
 
         self.dist_error = dist_error
         self.angle_error = angle_error
@@ -243,46 +254,32 @@ class PegInHole(SingleArmEnv):
         Returns:
             float: reward value
         """
-        # check euclidean distance between peg edge and the goal
-        peg_edge = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("peg_site")])
-        hole_middle_cylinder = np.array(
-            self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
-        dist = np.linalg.norm(peg_edge - hole_middle_cylinder)
-        eps = 0.0001  # avoiding inf rewards
-        dist_reward = 1 / (dist + 0.0001)
-        # check "how much" does the z axis of the hole and the peg are at the same direction
-        peg_ori_mat = np.array(
-            self.sim.data.site_xmat[self.sim.model.site_name2id('gripper0_grip_site')].reshape([3, 3]))
-        peg_z_axis = np.array([0, 0, 1])
-        peg_z_axis_in_world = peg_ori_mat @ peg_z_axis
-        z_axis_in_world = np.array([0, 0, 1])
-        projection = np.dot(peg_z_axis_in_world, z_axis_in_world)
-        projection_reward = 1 / (10 * (projection + 1))
-        reward = dist_reward  # + projection_reward
+        # if not self.robots[0].controller.is_robot_stable_bool:
+        #     reward = 0
+        #     print(reward)
+        #     return reward
         #
-        # # sparse completion reward
-        # if self._check_success():
-        #     reward = 2.25
-        #
-        # # use a shaping reward
-        # elif self.reward_shaping:
-        #
-        #     # reaching reward
-        #     cube_pos = self.sim.data.body_xpos[self.cube_body_id]
-        #     gripper_site_pos = self.sim.data.site_xpos[self.robots[0].eef_site_id]
-        #     dist = np.linalg.norm(gripper_site_pos - cube_pos)
-        #     reaching_reward = 1 - np.tanh(10.0 * dist)
-        #     reward += reaching_reward
-        #
-        #     # grasping reward
-        #     if self._check_grasp(gripper=self.robots[0].gripper, object_geoms=self.cube):
-        #         reward += 0.25
-        #
-        # # Scale reward if requested
-        # if self.reward_scale is not None:
-        #     reward *= self.reward_scale / 2.25
+        # # check euclidean distance between peg edge and the goal
+        # peg_edge = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("peg_site")])
+        # hole_middle_cylinder = np.array(
+        #     self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
+        # dist = np.linalg.norm(peg_edge - hole_middle_cylinder)
+        # eps = 0.0001  # avoiding inf rewards - the maximum reward is 10000
+        # dist_reward = 1 / (dist + eps)
 
-        return reward
+        # reward = dist_reward  # + direction_reward
+        # print(reward)
+
+        # return reward
+
+        # if not self.robots[0].controller.is_robot_stable_bool:
+        #     cost = 20000
+        #     print(cost)
+        #     return cost
+
+        cost = self.robots[0].controller.total_cost
+        # print(cost)
+        return cost
 
     def _load_model(self):
         """
@@ -305,8 +302,6 @@ class PegInHole(SingleArmEnv):
         # Arena always gets set to zero origin
         mujoco_arena.set_origin([0, 0, 0])
         self.rotation = None
-        x_range = [-0.0, 0.0]
-        y_range = [-0.1, -0.1]
 
         # initialize objects of interest
         self.peg = CylinderObject(name='peg',
@@ -337,17 +332,28 @@ class PegInHole(SingleArmEnv):
         else:
             rot_angle = self.rotation
 
-        hole_rot_set = str(np.array([np.cos(rot_angle / 2), 0, 0, np.sin(rot_angle / 2)]))
-        # hole_pos_set = np.array(
-        #     [np.random.uniform(high=x_range[0], low=x_range[1]), np.random.uniform(high=y_range[0], low=y_range[1]),
-        #      self.table_height])
-        hole_pos_set = np.array([0.015, 0.015, self.table_height])
+        # max_radial_shift = 0.0025
+        # min_radial_shift = 0.0012
+        # radial_shift = np.random.uniform(high=max_radial_shift, low=min_radial_shift)
+        # shift_angel = np.random.uniform(high=2 * np.pi, low=0)
+        # hole_pos_set = np.array([radial_shift * np.cos(shift_angel), radial_shift * np.sin(shift_angel),
+        #                          self.table_height]) + self.box_shift
+        hole_pos_set = np.array([0, 0.0025, self.table_height]) + self.box_shift
+
+        # hole_pos_set = np.array([self.radial_error * np.cos(self.angular_error),
+        #                          self.radial_error * np.sin(self.angular_error),
+        #                          self.table_height]) + self.box_shift
+
+        # for euler it is "xyz"
+        hole_rot_set = np.copy(self.box_ori)
+
         hole_pos_str = ' '.join(map(str, hole_pos_set))
         hole_rot_str = ' '.join(map(str, hole_rot_set))
 
         self.hole = PlateWithHoleObject(name='hole')
         hole_obj = self.hole.get_obj()
-        hole_obj.set("quat", hole_rot_str)
+        # hole_obj.set("axisangle", hole_rot_str)
+        hole_obj.set("euler", hole_rot_str)
         hole_obj.set("pos", hole_pos_str)
 
         self.model = ManipulationTask(

@@ -45,6 +45,8 @@ class Controller(object, metaclass=abc.ABCMeta):
                  plotting,
                  collect_data,
                  simulation_total_time,
+                 box_shift,
+                 box_ori,
                  ):
 
         # Actuator range
@@ -87,6 +89,7 @@ class Controller(object, metaclass=abc.ABCMeta):
 
         self.interaction_forces = None
         self.interaction_forces_vec = []
+        self.interaction_forces_mj_frame_vec = []
         self.PD_force_command = []
         self.desired_frame_FT_vec = []
         self.desired_frame_imp_position_vec = []
@@ -114,26 +117,51 @@ class Controller(object, metaclass=abc.ABCMeta):
 
         self.simulation_total_time = simulation_total_time  # from main
         # EC - define the duration of each trajectory part by the
-        self.trajectory_duration_ratio = 0.5
+        self.first_trajectory_duration_ratio = 0.2
+        self.second_trajectory_duration_ratio = 0.3
+        self.is_robot_stable_bool = True
 
-        # self.hole_middle_cylinder = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
-        # EC - when the box origin is at (0,0) the nominal_hole_middle_cylinder is at [0.2, 0.062, 0.8]
-        self.nominal_hole_middle_cylinder = np.array([0.2, 0.062, 0.8])
+        # this line means that the final ori between the box and the peg is permanent
+        self.ori_box_to_peg = np.array([[1, 0, 0],
+                                        [0, -1, 0],
+                                        [0, 0, -1]])
+        self.box_ori_mat = R.from_euler("xyz", box_ori).as_matrix()
+
+        self.hole_middle_cylinder = np.array(
+            self.sim.data.site_xpos[self.sim.model.site_name2id("hole_middle_cylinder")])
+        # EC - when the box origin is at (0,0) the nominal_hole_middle_cylinder is at [0.2, 0.062, need to look in xml]
+        # EC - this is for 21 radius hole
+        # self.nominal_hole_middle_cylinder = np.array([0.2, 0.062, self.hole_middle_cylinder[2]])
+        # EC - this is for a 4mm radius peg and a 5 mm hole -
+        self.nominal_hole_middle_cylinder = np.array([0.048, 0.0148, self.hole_middle_cylinder[2]]) + box_shift
+        # self.nominal_hole_middle_cylinder = self.hole_middle_cylinder
         self.peg_edge = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id("peg_site")])
-        self.delta_z = 0.005  # make sure not hitting tha table
-        self.z_diff = self.nominal_hole_middle_cylinder[2] - self.peg_edge[2] + self.delta_z
+        self.delta_z = 0.005  # make sure not hitting tha box - acts like spacer
+        self.z_diff = self.nominal_hole_middle_cylinder[2] - self.peg_edge[2]
+        self.table_height = 0.8  # doesn't spouse to be change
+        self.box_height = 0.06  # can be changed!!
+        self.peg_length = np.linalg.norm(self.initial_ee_pos - self.peg_edge)
+        self.eef_2_peg_edge_z_diff = self.peg_length  # only true if the peg ori needs to be vertical!
+        self.Table_origin_pos = np.array([0.0, 0.0, self.table_height])
 
         # EC - minimum jerk specification first trajectory_part
         self.first_trajectory_part_initial_position = self.initial_ee_pos
-        self.first_trajectory_part_final_position = [self.nominal_hole_middle_cylinder[0],
-                                                     self.nominal_hole_middle_cylinder[1],
-                                                     self.first_trajectory_part_initial_position[2]
-                                                     + self.z_diff + 7 * self.delta_z]
+        self.first_trajectory_part_final_position_box_frame = [self.nominal_hole_middle_cylinder[0],
+                                                               self.nominal_hole_middle_cylinder[1],
+                                                               self.box_height
+                                                               + self.eef_2_peg_edge_z_diff + 2 * self.delta_z]
+        self.first_trajectory_part_final_position = self.box_ori_mat @ \
+                                                    self.first_trajectory_part_final_position_box_frame \
+                                                    + self.Table_origin_pos
+        # self.first_trajectory_part_final_position = [self.nominal_hole_middle_cylinder[0],
+        #                                              self.nominal_hole_middle_cylinder[1],
+        #                                              self.table_height + self.box_height
+        #                                              + self.eef_2_peg_edge_z_diff + 2 * self.delta_z]
         self.first_trajectory_part_initial_orientation = self.initial_ee_ori_mat
-        self.first_trajectory_part_final_orientation = np.array([[1, 0, 0],
-                                                                 [0, -1, 0],
-                                                                 [0, 0, -1]])  # peg vertical (pointing down)
-
+        # self.first_trajectory_part_final_orientation = np.array([[1, 0, 0],
+        #                                                          [0, -1, 0],
+        #                                                          [0, 0, -1]])  # peg vertical (pointing down)
+        self.first_trajectory_part_final_orientation = self.box_ori_mat @ self.ori_box_to_peg
         self.first_trajectory_part_euler_initial_orientation = R.from_matrix(
             self.first_trajectory_part_initial_orientation).as_euler('xyz', degrees=False)
         self.first_trajectory_part_euler_final_orientation = R.from_matrix(
@@ -142,23 +170,26 @@ class Controller(object, metaclass=abc.ABCMeta):
             self.first_trajectory_part_euler_final_orientation - self.first_trajectory_part_euler_initial_orientation) > np.pi
         correction = np.sign(self.first_trajectory_part_euler_final_orientation) * (2 * np.pi) * indexes_for_correction
         self.first_trajectory_part_euler_final_orientation = self.first_trajectory_part_euler_final_orientation - correction
-        self.first_trajectory_part_final_time = self.simulation_total_time * self.trajectory_duration_ratio
+        # self.first_trajectory_part_final_time = self.simulation_total_time * self.first_trajectory_duration_ratio
+        self.first_trajectory_part_final_time = 1
 
         # EC - minimum jerk specification second trajectory_part
         self.initiate_trajectory = True
-        self.second_trajectory_part_initial_position = None
+        self.second_trajectory_part_initial_position = np.array([0.0, 0.0, 0.0])
         self.second_trajectory_part_final_position = None
         self.second_trajectory_part_initial_orientation = None
-        self.second_trajectory_part_final_orientation = np.array([[1, 0, 0],
-                                                                  [0, -1, 0],
-                                                                  [0, 0, -1]])  # peg vertical (pointing down)
+        self.second_trajectory_part_final_orientation = self.first_trajectory_part_final_orientation
         self.second_trajectory_part_euler_initial_orientation = None
         self.second_trajectory_part_euler_final_orientation = None
         self.second_trajectory_part_euler_final_orientation = None
-        self.second_trajectory_part_final_time = self.simulation_total_time
-
+        insertion_time = 3  # sec
+        self.second_trajectory_part_final_time = self.first_trajectory_part_final_time + insertion_time
+        # define the distance between the peg edge and the hole at the contact moment
+        self.peg_and_hole_contact_distance = None
+        self.total_cost = 0.0
+        # self.insertion_reward = 0
         # define a reference distance for deciding if the robot is not stable
-        self.nominal_stability_distance = None
+        self.nominal_stability_distance = 100  # make it effective only after contact
 
         # EC - Run further definition and class variables
         self._specify_constants()
@@ -168,42 +199,37 @@ class Controller(object, metaclass=abc.ABCMeta):
         self.is_contact = False  # becomes true when the peg hits the table
         self.contact_time = 0.0
         self.first_contact = True
+        self.peg_edge_contact_position = np.array([0.0, 0.0, 0.0])
         self.Delta_T = 0.002
         self.f_0 = np.array([0, 0, 0, 0, 0, 0])
+        self.mj_frame_wrench = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
         # EC - this is the default values
-        self.K = 5000
-        self.M = 5
+        self.K = 1000
+        self.M = 3
         Wn = np.sqrt(self.K / self.M)
         zeta = 0.707
         # zeta = 1
-        self.C = 2 * self.M * zeta * Wn
-        # C = 0
+        self.C = 3 * 2 * self.M * zeta * Wn
 
-        self.K_imp = self.K * np.array([[1, 0, 0, 0, 0, 0],
+        self.K_imp = self.K * np.array([[1.0, 0, 0, 0, 0, 0],
                                         [0, 1, 0, 0, 0, 0],
                                         [0, 0, 1, 0, 0, 0],
                                         [0, 0, 0, 1, 0, 0],
-                                        [0, 0, 0, 0, 1, 0],
-                                        [0, 0, 0, 0, 0, 1]])
-        self.C_imp = self.C * np.array([[1, 0, 0, 0, 0, 0],
-                                        [0, 1, 0, 0, 0, 0],
-                                        [0, 0, 1, 0, 0, 0],
+                                        [0, 0, 0, 0, 1.0, 0],
+                                        [0, 0, 0, 0, 0, 1.0]])
+        self.C_imp = self.C * np.array([[1.0, 0, 0, 0, 0, 0],
+                                        [0, 1.0, 0, 0, 0, 0],
+                                        [0, 0, 1.0, 0, 0, 0],
                                         [0, 0, 0, 1, 0, 0],
-                                        [0, 0, 0, 0, 1, 0],
-                                        [0, 0, 0, 0, 0, 1]])
-        self.M_imp = self.M * np.array([[1, 0, 0, 0, 0, 0],
-                                        [0, 1, 0, 0, 0, 0],
-                                        [0, 0, 1, 0, 0, 0],
-                                        [0, 0, 0, 1, 0, 0],
-                                        [0, 0, 0, 0, 1, 0],
-                                        [0, 0, 0, 0, 0, 1]])
-
-        # define if you want to plot some data
-        self.collect_data = collect_data
-        self.plotting = plotting
-
-    def impedance_computations(self):
+                                        [0, 0, 0, 0, 1.0, 0],
+                                        [0, 0, 0, 0, 0, 1.0]])
+        self.M_imp = self.M * np.array([[1.0, 0, 0, 0, 0, 0],
+                                        [0, 1.0, 0, 0, 0, 0],
+                                        [0, 0, 1.0, 0, 0, 0],
+                                        [0, 0, 0, 1.0, 0, 0],
+                                        [0, 0, 0, 0, 1.0, 0],
+                                        [0, 0, 0, 0, 0, 1.0]])
         # EC - compute next impedance Xm(n+1) and Vm(n+1) in world base frame.
         # state space formulation
         # X=[xm;thm;xm_d;thm_d] U=[F_int;M_int]
@@ -211,23 +237,30 @@ class Controller(object, metaclass=abc.ABCMeta):
         A_1 = np.concatenate((np.zeros([6, 6], dtype=int), np.identity(6)), axis=1)
         A_2 = np.concatenate((np.dot(-M_inv, self.K_imp), np.dot(-M_inv, self.C_imp)), axis=1)
         A = np.concatenate((A_1, A_2), axis=0)
-
+        e = np.linalg.eigvals(A)
         B_1 = np.zeros([6, 6], dtype=int)
         B_2 = M_inv
         B = np.concatenate((B_1, B_2), axis=0)
 
         # discrete state space A, B matrices interaction_forces
-        A_d = expm(A * self.Delta_T)
-        B_d = np.dot(np.dot(np.linalg.pinv(A), (A_d - np.identity(A_d.shape[0]))), B)
+        self.A_d = expm(A * self.Delta_T)
+        self.B_d = np.dot(np.dot(np.linalg.pinv(A), (self.A_d - np.identity(self.A_d.shape[0]))), B)
+
+        # define if you want to plot some data
+        self.collect_data = collect_data
+        self.plotting = plotting
+
+    def impedance_computations(self):
 
         # convert the forces and torques to the desired frame
         Rotation_world_to_desired = R.from_euler("xyz", self.min_jerk_orientation, degrees=False).as_matrix()
         Rotation_desired_to_world = Rotation_world_to_desired.T
         F_d = Rotation_desired_to_world @ self.interaction_forces[:3]
         M_d = Rotation_desired_to_world @ self.interaction_forces[3:6]
+        self.mj_frame_wrench = np.concatenate((F_d, M_d), axis=0)
         f_0 = np.concatenate((Rotation_desired_to_world @ self.f_0[:3],
                               Rotation_desired_to_world @ self.f_0[3:6]), axis=0)
-        U = (f_0 + np.concatenate((F_d, M_d), axis=0)).reshape(6, 1)
+        U = (f_0 + self.mj_frame_wrench).reshape(6, 1)
 
         # only for graphs!
         if self.collect_data:
@@ -238,7 +271,11 @@ class Controller(object, metaclass=abc.ABCMeta):
             self.desired_frame_imp_ang_vel_vec.append(np.array((self.X_m[9:12]).reshape(3, )))
 
         # discrete state solution X(k+1)=Ad*X(k)+Bd*U(k)
-        X_m_next = np.dot(A_d, self.X_m.reshape(12, 1)) + np.dot(B_d, U)
+        X_m_next = np.dot(self.A_d, self.X_m.reshape(12, 1)) + np.dot(self.B_d, U)
+        # if self.time > 9:
+        #     a = 5
+        #     b = 2*a
+        #     print('bag')
 
         self.X_m = deepcopy(X_m_next)
 
@@ -257,18 +294,32 @@ class Controller(object, metaclass=abc.ABCMeta):
             euler_final_orientation = self.first_trajectory_part_euler_final_orientation
             tfinal = self.first_trajectory_part_final_time
             t = self.time
-        else:  # second trajectory part
+        elif self.first_trajectory_part_final_time <= self.time < self.second_trajectory_part_final_time:
+            # second trajectory part
             if self.initiate_trajectory:
                 self.initiate_trajectory = False
                 self.nominal_stability_distance = np.linalg.norm(self.peg_edge -
-                                        np.array(self.sim.data.site_xpos[
-                                                     self.sim.model.site_name2id("hole_middle_cylinder")]))
-                self.z_diff = self.nominal_hole_middle_cylinder[2] - self.peg_edge[2] + self.delta_z
+                                                                 np.array(self.sim.data.site_xpos[
+                                                                              self.sim.model.site_name2id(
+                                                                                  "hole_middle_cylinder")]))
+                hole_to_peg_edge = self.nominal_hole_middle_cylinder - self.peg_edge
+                hole_to_peg_edge_box_frame = self.box_ori_mat.T @ hole_to_peg_edge
+                # self.z_diff = self.nominal_hole_middle_cylinder[2] - self.peg_edge[2]
+                z_diff_box_frame = hole_to_peg_edge_box_frame[2]
                 self.second_trajectory_part_initial_position = self.ee_pos
-                self.second_trajectory_part_final_position = [self.nominal_hole_middle_cylinder[0],
-                                                              self.nominal_hole_middle_cylinder[1],
-                                                              self.second_trajectory_part_initial_position[
-                                                                  2] + self.z_diff]
+                second_trajectory_part_initial_position_box_frame = self.box_ori_mat.T @ \
+                                                                    (self.ee_pos - self.Table_origin_pos)
+                # self.second_trajectory_part_final_position = [self.nominal_hole_middle_cylinder[0],
+                #                                               self.nominal_hole_middle_cylinder[1],
+                #                                               self.second_trajectory_part_initial_position[
+                #                                                   2] + self.z_diff]
+                second_trajectory_part_final_position_box_frame = [self.nominal_hole_middle_cylinder[0],
+                                                                   self.nominal_hole_middle_cylinder[1],
+                                                                   second_trajectory_part_initial_position_box_frame[
+                                                                       2] + z_diff_box_frame]
+                self.second_trajectory_part_final_position = self.box_ori_mat @ \
+                                                             second_trajectory_part_final_position_box_frame \
+                                                             + self.Table_origin_pos
                 self.second_trajectory_part_initial_orientation = self.ee_ori_mat
                 self.second_trajectory_part_euler_initial_orientation = R.from_matrix(
                     self.second_trajectory_part_initial_orientation).as_euler('xyz', degrees=False)
@@ -277,14 +328,14 @@ class Controller(object, metaclass=abc.ABCMeta):
                 indexes_for_correction = np.abs(
                     self.second_trajectory_part_euler_final_orientation - self.second_trajectory_part_euler_initial_orientation) > np.pi
                 correction = np.sign(self.second_trajectory_part_euler_final_orientation) * (
-                            2 * np.pi) * indexes_for_correction
+                        2 * np.pi) * indexes_for_correction
                 self.second_trajectory_part_euler_final_orientation = self.second_trajectory_part_euler_final_orientation - correction
 
             X_init, Y_init, Z_init = self.second_trajectory_part_initial_position
             X_final, Y_final, Z_final = self.second_trajectory_part_final_position
             euler_initial_orientation = self.second_trajectory_part_euler_initial_orientation
             euler_final_orientation = self.second_trajectory_part_euler_final_orientation
-            tfinal = self.simulation_total_time - self.first_trajectory_part_final_time
+            tfinal = self.second_trajectory_part_final_time - self.first_trajectory_part_final_time
             t = self.time - self.first_trajectory_part_final_time
 
         x_traj = (X_final - X_init) / (tfinal ** 3) * (
@@ -588,6 +639,7 @@ class Controller(object, metaclass=abc.ABCMeta):
         self.real_orientation_vec.append(self.real_orientation)
         self.real_angle_velocity_vec.append(self.real_angle_velocity)
         self.interaction_forces_vec.append(np.array(self.interaction_forces))
+        self.interaction_forces_mj_frame_vec.append(np.array(self.mj_frame_wrench))
 
     def plotter(self):
 
@@ -608,6 +660,7 @@ class Controller(object, metaclass=abc.ABCMeta):
         real_orientation = np.array(self.real_orientation_vec)
         real_angle_velocity = np.array(self.real_angle_velocity_vec)
         interaction_forces = np.array(self.interaction_forces_vec)
+        interaction_forces_mj_frame = np.array(self.interaction_forces_mj_frame_vec)
         PD_force_command = np.array(self.PD_force_command)
 
         plt.figure()
@@ -715,19 +768,22 @@ class Controller(object, metaclass=abc.ABCMeta):
 
         ax1 = plt.subplot(311)
         ax1.plot(time, interaction_forces[:, 0], 'r--', label="from sensor")
+        ax1.plot(time, interaction_forces_mj_frame[:, 0], 'k--', label="from sensor - mj frame")
         ax1.plot(time, PD_force_command[:, 0], 'g--', label="from PD")
         ax1.legend()
         ax1.set_title("Fx [N]")
 
         ax2 = plt.subplot(312)
         ax2.plot(time, interaction_forces[:, 1], 'r--', label="from sensor")
+        ax2.plot(time, interaction_forces_mj_frame[:, 1], 'k--', label="from sensor - mj frame")
         ax2.plot(time, PD_force_command[:, 1], 'g--', label="from PD")
         ax2.legend()
         ax2.set_title("Fy [N]")
 
         ax3 = plt.subplot(313)
-        ax3.plot(time, interaction_forces[:, 1], 'r--', label="from sensor")
-        ax3.plot(time, PD_force_command[:, 1], 'g--', label="from PD")
+        ax3.plot(time, interaction_forces[:, 2], 'r--', label="from sensor")
+        ax3.plot(time, interaction_forces_mj_frame[:, 2], 'k--', label="from sensor - mj frame")
+        ax3.plot(time, PD_force_command[:, 2], 'g--', label="from PD")
         ax3.legend()
         ax3.set_title("Fz [N]")
 
@@ -737,18 +793,21 @@ class Controller(object, metaclass=abc.ABCMeta):
 
         ax1 = plt.subplot(311)
         ax1.plot(time, interaction_forces[:, 3], 'r--', label="from sensor")
+        ax1.plot(time, interaction_forces_mj_frame[:, 3], 'k--', label="from sensor - mj frame")
         ax1.plot(time, PD_force_command[:, 3], 'g--', label="from PD")
         ax1.legend()
         ax1.set_title("Mx [Nm]")
 
         ax2 = plt.subplot(312)
         ax2.plot(time, interaction_forces[:, 4], 'r--', label="from sensor")
+        ax2.plot(time, interaction_forces_mj_frame[:, 4], 'k--', label="from sensor - mj frame")
         ax2.plot(time, PD_force_command[:, 4], 'g--', label="from PD")
         ax2.legend()
         ax2.set_title("My [Nm]")
 
         ax3 = plt.subplot(313)
         ax3.plot(time, interaction_forces[:, 5], 'r--', label="from sensor")
+        ax3.plot(time, interaction_forces_mj_frame[:, 5], 'k--', label="from sensor - mj frame")
         ax3.plot(time, PD_force_command[:, 5], 'g--', label="from PD")
         ax3.legend()
         ax3.set_title("Mz [Nm]")
@@ -810,10 +869,15 @@ class Controller(object, metaclass=abc.ABCMeta):
 
     # EC
     def is_robot_stable(self):
-        is_robot_stable = True
         if self.is_contact:
             current_distance = np.linalg.norm(self.peg_edge - np.array(self.sim.data.site_xpos[
-                                                     self.sim.model.site_name2id("hole_middle_cylinder")]))
-            if self.nominal_stability_distance < current_distance:
-                is_robot_stable = False
-        return is_robot_stable
+                                                                           self.sim.model.site_name2id(
+                                                                               "hole_middle_cylinder")]))
+            impedance_deviation = any(abs(self.X_m) > 100)
+            if 2 * self.nominal_stability_distance < current_distance or impedance_deviation:
+                if impedance_deviation:
+                    print("robot is unstable due to impedance deviation")
+                if 2 * self.nominal_stability_distance < current_distance:
+                    print("robot is unstable due to high distance between the peg and the hole")
+                self.is_robot_stable_bool = False
+        return self.is_robot_stable_bool

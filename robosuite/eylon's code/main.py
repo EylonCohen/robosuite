@@ -4,113 +4,164 @@ from robosuite.wrappers import GymWrapper
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
+from multiprocessing import Pool
 
 import numpy as np
 from typing import Callable, List, Optional, Tuple, Union
 import os
 import gym
+
 import numpy as np
-
-
-class mainUtils(object):
-    def __init__(self,
-                 simulation_total_time=5,  # sec
-                 control_freq=50,
-                 ):
-        self.simulation_total_time = simulation_total_time  # sec
-        self.control_freq = control_freq
-        self.Horizon = self.control_freq * self.simulation_total_time
-
-    def get_control_param(self, Use_video_for_simulation):
-        plotting = Use_video_for_simulation
-        collect_data = Use_video_for_simulation
-        Control_param = dict(type='JOINT_TORQUE', input_max=1, input_min=-1,
-                             output_max=[0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
-                             output_min=[-0.05, -0.05, -0.05, -0.5, -0.5, -0.5], kp=700, damping_ratio=np.sqrt(2),
-                             impedance_mode='fixed', kp_limits=[0, 100000], damping_ratio_limits=[0, 10],
-                             position_limits=None,
-                             orientation_limits=None, uncouple_pos_ori=True, control_delta=True, interpolation=None,
-                             ramp_ratio=0.2,
-                             control_dim=108,
-                             plotting=plotting,
-                             collect_data=collect_data,
-                             simulation_total_time=self.simulation_total_time)
-        return Control_param
-
-    def get_gym_like_env(self, Use_video_for_simulation):
-        has_renderer = Use_video_for_simulation
-        Env = GymWrapper(
-            suite.make(
-                "PegInHole",
-                # "Lift",
-                robots="UR5e",  # use UR5e robot
-                # user_init_qpos=[-0.470, -1.735, 2.480, -2.275, -1.590, -1.991],# EC - set initial position of the joints
-                user_init_qpos=[-0.09525062, -0.8314843, 1.20965442, -1.94896648, -1.57079633, -1.66604693],
-                # EC - set initial position of the joints
-                use_camera_obs=False,  # do not use pixel observations
-                has_offscreen_renderer=False,  # not needed since not using pixel obs
-                has_renderer=has_renderer,
-                reward_shaping=True,  # use dense rewards
-                ignore_done=False,
-                horizon=self.Horizon,
-                control_freq=self.control_freq,
-                controller_configs=control_param,
-                Peg_density=1,
-
-            )
-        )
-        # make sure the env is valid for stable_baselines3
-        # check_env(Env, warn=True)
-
-        return Env
-
-    def execute_learning(self, Model_name, Env):
-        model = PPO("MlpPolicy", Env, verbose=1)
-        model.learn(total_timesteps=3)
-        model.save(Model_name)
-
-    def model_test(self, Model_name, Env):
-        model = PPO.load(Model_name)
-        Obs = Env.reset()
-        Done = False
-        while not Done:
-            Action, _states = model.predict(Obs)
-            Obs, Rewards, Done, Info = Env.step(Action)
-            Env.render()
-
-    def simulation(self, Env, Use_video_for_simulation):
-        Env.reset()
-        Done = False
-        Action = np.random.randn(Env.robots[0].action_dim)  # the impedance parameters
-
-        while not Done:
-            Obs, Reward, Done, Info = Env.step(Action)  # take action in the environment
-            if Use_video_for_simulation:
-                Env.render()  # render on display
-        #
-        # # EC -  get all path information
-        # info = Env.get_path_info()
-        #
-        # # Wrap this environment in a visualization wrapper
-        # Env = VisualizationWrapper(Env, indicator_configs=None)
-
+import time
+from robosuite.utils.learning_class import RlClass, Simulation, GaClass
+from scipy.optimize import differential_evolution as de
+import pickle
+from robosuite.utils.control_utils import build_imp_matrices_circular_peg, is_pos_def, is_stable_system
 
 if __name__ == "__main__":
     # 'use_video_for_simulation' variable decide whether to do RL or to display the simulation
     # where True means display simulation and False means do RL
-
+    #
     # use_video_for_simulation = True
-    use_video_for_simulation = False
+    # sim = Simulation(simulation_total_time=10, control_freq=50)
+    # # control definitions
+    # control_param = sim.get_control_param(use_video_for_simulation)
+    # # environment definitions
+    # start = time.time()
+    # env = sim.get_gym_like_env(use_video_for_simulation, control_param, radial_error=0.0025, angular_error=np.deg2rad(0))
+    # end = time.time()
+    # print(end - start)
+    # sim.simulation(env, use_video_for_simulation)
 
-    M = mainUtils()
+    use_video_for_simulation = False
+    sim = Simulation(simulation_total_time=10, control_freq=1)
     # control definitions
-    control_param = M.get_control_param(use_video_for_simulation)
+    control_param = sim.get_control_param(use_video_for_simulation)
     # environment definitions
-    env = M.get_gym_like_env(use_video_for_simulation)
-    # start RL
-    model_name = "IMP_model_v1"
-    M.execute_learning(model_name, env)
-    # # test the model
-    # M.model_test(model_name, env)
-    # run the simulation without a model
-    # M.simulation(env, use_video_for_simulation)
+    env_number = 1
+    min_radial_error = 0.0012  # [m]
+    max_radial_error = 0.0025  # [m]
+    radial_error_vec = np.linspace(min_radial_error, max_radial_error, num=env_number)
+    # radial_error_vec = np.random.uniform(high=max_radial_error, low=min_radial_error, size=env_number)
+    min_angular_error = 0.0  # [m]
+    rounds = 5
+    max_angular_error = np.deg2rad(360 * rounds)  # [rad]
+    angular_error_vec = np.linspace(min_angular_error, max_angular_error, num=env_number)
+    # envs = [sim.get_gym_like_env(use_video_for_simulation, control_param,
+    #                              radial_error=radial_error_vec[i], angular_error=angular_error_vec[i])
+    #         for i in range(env_number)]
+    env = sim.get_gym_like_env(use_video_for_simulation, control_param,
+                               radial_error=0.0012, angular_error=0)
+
+
+    def fitness_func(action):
+        total_cost = 6000 * env_number  # this is for the case A has positive eig
+        K_imp, C_imp, M_imp, A, A_d, B_d = build_imp_matrices_circular_peg(action)
+        if is_stable_system(A):
+            total_cost = 0.0
+            # idx = 0
+            action = np.concatenate((action, np.array([1])))  # the 1 is for the gripper to be closed
+            for i in range(env_number):
+                env.reset()
+                Obs, cost, Done, Info = env.step(action)  # take action in the environment
+                if not env.robots[0].controller.is_robot_stable_bool:
+                    # total_cost += (env_number - idx) * 5000  # get a better result if the peg did get in i previous runs
+                    total_cost += 5000  # add cost but keep checking other solutions
+                    # print(total_cost)
+                    # return total_cost
+                else:
+                    total_cost += cost
+                    # idx += 1
+        total_cost = total_cost / env_number  # to reduce the numbers value
+        print(total_cost)
+        return total_cost
+
+
+    # x = np.arange(20*12).reshape(20, 12)
+    #
+    # with Pool(4) as pwl:
+    #     output = pwl.map(fitness_func, x)
+    #
+    # print(output)
+
+    # # K_bounds = [K1, K2, K3, K4, K5, K6]
+    # K_bounds = [(0, 10000), (0.0001, 0.01), (0, 10000),
+    #             (0, 100), (0, 10000), (0, 10000)]
+    # # M_bounds = [M1, M2, M3, M4, M5, M6]
+    # M_bounds = [(0, 100), (0, 100), (0, 100),
+    #             (0, 100), (0, 100), (0, 100)]
+    # # bounds = [K_bounds, C_bounds, M_bounds]
+    # bounds = [K_bounds, M_bounds]
+    # x0 = np.array([7.55022625e+03, 6.78138403e-03, 3.97646868e+03, 6.41925579e+01,
+    #                7.48784099e+03, 8.32513966e+03, 6.53180852e+01, 9.70823481e+01,
+    #                1.40992887e+00, 5.85738701e+01, 5.00239987e+01, 1.51216855e+01])
+
+    # K_bounds = [K1, K2, K3, K4, K5, K6, K7, K8, K9, K10]
+    K_bounds = [(0, 10000), (0, 10000), (0.0001, 0.01), (0, 10000), (0, 10000),
+                (0, 100), (0, 10000), (-10000, 0), (-10000, 0), (0, 10000)]
+    # M_bounds = [M1, M2, M3, M4, M5, M6]
+    M_bounds = [(0, 100), (0, 100), (0, 100),
+                (0, 100), (0, 100), (0, 100)]
+    # bounds = [K_bounds, C_bounds, M_bounds]
+    bounds = [K_bounds, M_bounds]
+
+    # # K_bounds = [K1, K2, K3, K4, K5, K6]
+    # K_bounds = [(0, 10000), (0, 10000), (100, 10000), (0, 10000), (0, 10000), (0, 10)]
+    # # M_bounds = [M1, M2, M3, M4, M5, M6]
+    # M_bounds = [(0, 100), (0, 100), (0, 100), (0, 100), (0, 100), (0, 100)]
+    # # C_bounds = [C1, C2, C3, C4, C5, C6]
+    # C_bounds = [(0, 10000), (0, 10000), (0, 10000), (0, 10000), (0, 10000), (0, 10000)]
+    # # W_bounds = [W1, W2, W4, W5, K7, W8, W9, W10]
+    # W_bounds = [(0, 10000), (0, 10000), (0, 10000), (0, 10000), (0, 10000), (-10000, 0),
+    #             (-10000, 0), (0, 10000)]
+    # bounds = [K_bounds, M_bounds, C_bounds, W_bounds]
+
+    # flattened the list
+    bounds = [val for sublist in bounds for val in sublist]
+    result = de(func=fitness_func, bounds=bounds, maxiter=1000, popsize=10, disp=True, workers=-1,
+                updating='deferred', strategy='best2bin')
+    pickle.dump(result, open("result.p", "wb"))
+    saved_result = pickle.load(open("result.p", "rb"))
+    print(saved_result)
+
+    # RL = RlClass()
+    # # start RL
+    # model_name = "IMP_model_v1"
+    # RL.execute_learning(model_name, env)
+    # # # test the model
+    # # RL.model_test(model_name, env)
+
+    # Ga = GaClass(Env=env)
+    # Ga.ga_instance.run()
+
+    # solution, solution_fitness, solution_idx = Ga.ga_instance.best_solution()
+    # print("Parameters of the best solution : {solution}".format(solution=solution))
+    # print("Fitness value of the best solution = {solution_fitness}".format(solution_fitness=solution_fitness))
+    # function_inputs = [4, -2, 3.5, 5, -11, -4.7]
+    # prediction = np.sum(np.array(function_inputs) * solution)
+    # print("Predicted output based on the best solution : {prediction}".format(prediction=prediction))
+
+    # function_inputs = [4, -2, 3.5, 5, -11, -4.7]  # Function inputs.
+    # desired_output = 44  # Function output.
+    #
+    #
+    # def fitness_func(solution, *args):
+    #     a = env.action_space
+    #     # print(a)
+    #     output = np.sum(solution * function_inputs)
+    #     fitness = 1.0 / (np.abs(output - desired_output) + 0.000001)
+    #     return -fitness
+    #
+    #
+    # bounds = [(-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10)]
+    # result = de(func=fitness_func, bounds=bounds, updating='deferred', workers=-1)
+    #
+    # # function_inputs = np.array(function_inputs)
+    # # temp = DEClass()
+    # # result = temp.DE
+    # r = np.dot(np.array(result.x), function_inputs)
+    # print(result)
+    # print(r)
+    # pickle.dump(result, open("save.p", "wb"))
+    # saved_result = pickle.load(open("save.p", "rb"))
+    # print(saved_result)

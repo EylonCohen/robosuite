@@ -57,9 +57,12 @@ class GymWrapper(Wrapper, Env):
         # EC
         # self.modality_dims = {key: obs[key].shape for key in self.keys}
         # flat_ob = self._flatten_obs(obs)
+
         # EC
-        flat_ob = [np.array(obs['Not_really_obs']).flatten()]
-        self.obs_dim = len(flat_ob)
+        # flat_ob = [np.array(obs['Not_really_obs']).flatten()]
+        # self.obs_dim = len(flat_ob)
+
+        self.obs_dim = len(obs)
         high = np.inf * np.ones(self.obs_dim)
         low = -high
         self.observation_space = spaces.Box(low=low, high=high)
@@ -94,8 +97,9 @@ class GymWrapper(Wrapper, Env):
         """
         ob_dict = self.env.reset()
         # EC
-        flat_ob = [np.array(ob_dict['Not_really_obs']).flatten()]
+        # flat_ob = [np.array(ob_dict['Not_really_obs']).flatten()]
         # return self._flatten_obs(ob_dict)
+        flat_ob = ob_dict
         return flat_ob
 
     def step(self, action):

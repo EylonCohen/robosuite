@@ -1,4 +1,7 @@
 import numpy as np
+from numpy import copy
+from scipy.linalg import expm
+
 import robosuite.utils.transform_utils as trans
 from robosuite.utils.numba import jit_decorator
 
@@ -145,7 +148,7 @@ def set_goal_position(delta,
         goal_position = current_position + delta
 
     if position_limit is not None:
-        if position_limit.shape != (2,n):
+        if position_limit.shape != (2, n):
             raise ValueError("Position limit should be shaped (2,{}) "
                              "but is instead: {}".format(n, position_limit.shape))
 
@@ -189,7 +192,7 @@ def set_goal_orientation(delta,
 
     # check for orientation limits
     if np.array(orientation_limit).any():
-        if orientation_limit.shape != (2,3):
+        if orientation_limit.shape != (2, 3):
             raise ValueError("Orientation limit should be shaped (2,3) "
                              "but is instead: {}".format(orientation_limit.shape))
 
@@ -245,3 +248,118 @@ def set_goal_orientation(delta,
         if limited:
             goal_orientation = trans.euler2mat(np.array([euler[0], euler[1], euler[2]]))
     return goal_orientation
+
+
+def build_imp_matrices_circular_peg(action):
+    # implementation of the structure of K for circular peg
+    # original case
+    # K1, K2, K3, K4, K5, K6 = action[0], action[1], action[2], action[3], action[4], action[5]
+    # M1, M2, M3, M4, M5, M6 = action[6], action[7], action[8], action[9], action[10], action[11]
+    # K_imp_inv = np.array([[K1, 0, 0, 0, -K5, 0],
+    #                       [0, K1, 0, K5, 0, 0],
+    #                       [0, 0, K2, 0, 0, 0],
+    #                       [0, -K6, 0, K3, 0, 0],
+    #                       [K6, 0, 0, 0, K3, 0],
+    #                       [0, 0, 0, 0, 0, K4]])
+
+    K1, K2, K3, K4, K5, K6, K7, K8, K9, K10 = action[0], action[1], action[2], action[3], \
+                                              action[4], action[5], action[6], action[7], action[8], action[9]
+    M1, M2, M3, M4, M5, M6 = action[10], action[11], action[12], action[13], action[14], action[15]
+
+    K_imp_inv = np.array([[K1, 0, 0, 0, K8, 0],
+                          [0, K2, 0, K7, 0, 0],
+                          [0, 0, K3, 0, 0, 0],
+                          [0, K9, 0, K4, 0, 0],
+                          [K10, 0, 0, 0, K5, 0],
+                          [0, 0, 0, 0, 0, K6]])
+
+    if np.linalg.det(K_imp_inv) == 0:  # k_inv is singular
+        # this is for making sure A has positive eig and the inverse of K_inv would not be calculated
+        A = np.identity(2)
+        return 0, 0, 0, A, 0, 0
+
+    K_imp = np.linalg.inv(K_imp_inv)
+    M_imp = np.array([[M1, 0, 0, 0, M5, 0],
+                      [0, M1, 0, M5, 0, 0],
+                      [0, 0, M2, 0, 0, 0],
+                      [0, M6, 0, M3, 0, 0],
+                      [M6, 0, 0, 0, M3, 0],
+                      [0, 0, 0, 0, 0, M4]])
+
+    zeta = 0.707
+    C_multiplier = 1
+    # Wn = sqrt(k/m) , C = 2 * zeta * Wn
+    C_imp = copy(K_imp)  # just for initialization
+    for idx, x in np.ndenumerate(K_imp):
+        if M_imp[idx] != 0:
+            Wn = np.sqrt(np.abs(x) / M_imp[idx])
+            C_imp[idx] = C_multiplier * 2 * zeta * np.sign(x) * Wn
+        else:
+            C_imp[idx] = 0
+        M_imp[idx] = np.sign(x) * M_imp[idx]  # make M values sign the same as K values
+
+    # K1, K2, K3, K4, K5, K6 = action[0], action[1], action[2], action[3], action[4], action[5]
+    # M1, M2, M3, M4, M5, M6 = action[6], action[7], action[8], action[9], action[10], action[11]
+    # C1, C2, C3, C4, C5, C6 = action[12], action[13], action[14], action[15], action[16], action[17]
+    #
+    # # Weight mat param
+    # W1, W2, W4, W5, W7, W8, W9, \
+    # W10 = action[18], action[19], action[20], action[21], \
+    #       action[22], action[23], action[24], action[25]
+    # W3, W6 = 1.0, 1.0
+    # W = np.array([[W1, 0, 0, 0, W8, 0],
+    #               [0, W2, 0, W7, 0, 0],
+    #               [0, 0, W3, 0, 0, 0],
+    #               [0, W9, 0, W4, 0, 0],
+    #               [W10, 0, 0, 0, W5, 0],
+    #               [0, 0, 0, 0, 0, W6]])
+    # if np.linalg.det(W) == 0:  # W_inv is singular
+    #     # this is for making sure A has positive eig and the inverse of K_inv would not be calculated
+    #     A = np.identity(2)
+    #     return 0, 0, 0, A, 0, 0
+    #
+    # W_inv = np.linalg.inv(W)
+    # K_imp = W_inv @ np.array([[K1, 0, 0, 0, 0, 0],
+    #                           [0, K2, 0, 0, 0, 0],
+    #                           [0, 0, K3, 0, 0, 0],
+    #                           [0, 0, 0, K4, 0, 0],
+    #                           [0, 0, 0, 0, K5, 0],
+    #                           [0, 0, 0, 0, 0, K6]])
+    # M_imp = W_inv @ np.array([[M1, 0, 0, 0, 0, 0],
+    #                           [0, M2, 0, 0, 0, 0],
+    #                           [0, 0, M3, 0, 0, 0],
+    #                           [0, 0, 0, M4, 0, 0],
+    #                           [0, 0, 0, 0, M5, 0],
+    #                           [0, 0, 0, 0, 0, M6]])
+    # C_imp = W_inv @ np.array([[C1, 0, 0, 0, 0, 0],
+    #                           [0, C2, 0, 0, 0, 0],
+    #                           [0, 0, C3, 0, 0, 0],
+    #                           [0, 0, 0, C4, 0, 0],
+    #                           [0, 0, 0, 0, C5, 0],
+    #                           [0, 0, 0, 0, 0, C6]])
+
+    M_inv = np.linalg.pinv(M_imp)
+    A_1 = np.concatenate((np.zeros([6, 6], dtype=int), np.identity(6)), axis=1)
+    A_2 = np.concatenate((np.dot(-M_inv, K_imp), np.dot(-M_inv, C_imp)), axis=1)
+    A = np.concatenate((A_1, A_2), axis=0)
+
+    B_1 = np.zeros([6, 6], dtype=int)
+    B_2 = M_inv
+    B = np.concatenate((B_1, B_2), axis=0)
+
+    # discrete state space A, B matrices interaction_forces
+    Delta_T = 0.002
+    A_d = expm(A * Delta_T)
+    B_d = np.dot(np.dot(np.linalg.pinv(A), (A_d - np.identity(A_d.shape[0]))), B)
+    return K_imp, C_imp, M_imp, A, A_d, B_d
+
+
+def is_pos_def(x):
+    return np.all(np.linalg.eigvals(x) > 0)
+
+
+def is_stable_system(x):
+    eig = np.linalg.eigvals(x)
+    real_eig = np.real(eig)
+    is_stable_system_bool = np.all(real_eig < 0)
+    return is_stable_system_bool

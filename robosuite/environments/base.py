@@ -149,6 +149,9 @@ class MujocoEnv(metaclass=EnvMeta):
         # Load observables
         self._observables = self._setup_observables()
 
+        # EC
+        self.is_robot_stable_bool = True  # if False then the robot is unstable
+
     def initialize_time(self, control_freq):
         """
         Initializes the time constants used for simulation.
@@ -252,9 +255,10 @@ class MujocoEnv(metaclass=EnvMeta):
         # Make sure that all sites are toggled OFF by default
         self.visualize(vis_settings={vis: False for vis in self._visualizations})
         # Return new observations
-        obs = OrderedDict()
-        obs['Not_really_obs'] = 1
-
+        # EC
+        # obs = OrderedDict()
+        # obs['Not_really_obs'] = 1
+        obs = np.array([1])
         # return self._get_observations(force_update=True)
         return obs
 
@@ -412,8 +416,8 @@ class MujocoEnv(metaclass=EnvMeta):
             #  EC - in the learning notation the 'policy step' is actually relevant only fo the first step!!
             policy_step = True
             while not done:
-                if self.done:
-                    raise ValueError("executing action in terminated episode")
+                # if self.done:
+                #     raise ValueError("executing action in terminated episode")
 
                 self.timestep += 1
                 # Loop through the simulation at the model timestep rate until we're ready to take the next policy step
@@ -422,21 +426,26 @@ class MujocoEnv(metaclass=EnvMeta):
                     self.sim.forward()
                     self._pre_action(action, policy_step)
                     self.sim.step()
+                    done, info = self._post_action(action)
+                    if done:
+                        break
                     self._update_observables()
                     policy_step = False
 
                 # Note: this is done all at once to avoid floating point inaccuracies
                 self.cur_time += self.control_timestep
 
-                done, info = self._post_action(action)
+                # done, info = self._post_action(action)
             # EC - compute reward only once at the end of the episode
             reward = self.reward(action)
             ########################################
 
         # EC - make obs not relevant
         # return self._get_observations(), reward, done, info
-        obs = OrderedDict()
-        obs['Not_really_obs'] = 1
+        # EC
+        # obs = OrderedDict()
+        # obs['Not_really_obs'] = 1
+        obs = np.array([1])
         return obs, reward, done, info
 
     # EC
@@ -475,7 +484,8 @@ class MujocoEnv(metaclass=EnvMeta):
         # reward = self.reward(action)
 
         # done if number of elapsed timesteps is greater than horizon
-        self.done = (self.timestep >= self.horizon or self.is_robot_stable() == False) and not self.ignore_done
+        self.is_robot_stable_bool = self.is_robot_stable()
+        self.done = (self.timestep >= self.horizon or self.is_robot_stable_bool == False) and not self.ignore_done
 
         # return reward, self.done, {}
         return self.done, {}
